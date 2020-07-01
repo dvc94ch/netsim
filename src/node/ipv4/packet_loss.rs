@@ -1,4 +1,9 @@
-use crate::priv_prelude::*;
+use super::Ipv4Node;
+use crate::network::NetworkHandle;
+use crate::range::Ipv4Range;
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::Ipv4Plug;
+use std::time::Duration;
 
 /// A `Node` which adds packet loss to an underlying node.
 pub struct PacketLossNode<N> {
@@ -8,15 +13,15 @@ pub struct PacketLossNode<N> {
 }
 
 /// Create a node which adds packet loss to the underlying `node`.
-pub fn packet_loss<N>(
-    loss_rate: f64,
-    mean_loss_duration: Duration,
-    node: N,
-) -> PacketLossNode<N>
+pub fn packet_loss<N>(loss_rate: f64, mean_loss_duration: Duration, node: N) -> PacketLossNode<N>
 where
     N: Ipv4Node,
 {
-    PacketLossNode { node, loss_rate, mean_loss_duration }
+    PacketLossNode {
+        node,
+        loss_rate,
+        mean_loss_duration,
+    }
 }
 
 impl<N> Ipv4Node for PacketLossNode<N>
@@ -35,4 +40,3 @@ where
         (spawn_complete, plug)
     }
 }
-

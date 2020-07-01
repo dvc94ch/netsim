@@ -1,4 +1,7 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::PacketLoss;
+use crate::wire::EtherPlug;
+use std::time::Duration;
 
 /// Adds packet loss to an ethernet connection
 pub struct EtherPacketLoss {
@@ -14,7 +17,12 @@ impl EtherPacketLoss {
         plug_a: EtherPlug,
         plug_b: EtherPlug,
     ) {
-        PacketLoss::spawn(handle, loss_rate, mean_loss_duration, plug_a.into(), plug_b.into())
+        PacketLoss::spawn(
+            handle,
+            loss_rate,
+            mean_loss_duration,
+            plug_a.into(),
+            plug_b.into(),
+        )
     }
 }
-

@@ -1,5 +1,15 @@
-use crate::priv_prelude::*;
-use crate::spawn_complete;
+use crate::device::ether::HubBuilder;
+use crate::network::NetworkHandle;
+use crate::node::ether::EtherNode;
+use crate::range::{Ipv4Range, Ipv6Range};
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::EtherPlug;
+use futures::channel::oneshot;
+use futures::future::Future;
+use std::any::Any;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// A set of clients that can be attached to a hub node.
 pub trait HubClients {
@@ -24,13 +34,13 @@ macro_rules! tuple_impl {
     ($($ty:ident,)*) => {
         impl<$($ty),*> HubClients for ($($ty,)*)
         where
-            $($ty: EtherNode + Send + 'static,)*
+            $($ty: EtherNode + Unpin + Send + 'static,)*
         {
             type Output = ($($ty::Output,)*);
 
             fn build(
                 self,
-                handle: &NetworkHandle, 
+                handle: &NetworkHandle,
                 ipv4_range: Option<Ipv4Range>,
                 ipv6_range: Option<Ipv6Range>,
             ) -> (SpawnComplete<Self::Output>, EtherPlug)
@@ -69,14 +79,12 @@ macro_rules! tuple_impl {
                 hub.spawn(handle);
 
                 let (ret_tx, ret_rx) = oneshot::channel();
-                handle.spawn({
-                    Future::then(join_all, |result| {
-                        let _ = ret_tx.send(result);
-                        Ok(())
-                    })
-                });
+                handle.spawn(Box::pin(async move {
+                    let result = join_all.await;
+                    let _ = ret_tx.send(result);
+                }));
 
-                let spawn_complete = spawn_complete::from_receiver(ret_rx);
+                let spawn_complete = SpawnComplete::from_receiver(ret_rx);
 
                 (spawn_complete, plug_0)
             }
@@ -84,25 +92,27 @@ macro_rules! tuple_impl {
 
         impl<$($ty),*> Future for JoinAll<($($ty,)*), ($((SpawnComplete<$ty::Output>, Option<$ty::Output>),)*)>
         where
-            $($ty: EtherNode + 'static,)*
+            $($ty: EtherNode + Unpin + 'static,)*
         {
-            type Item = ($($ty::Output,)*);
-            type Error = Box<Any + Send + 'static>;
+            type Output = Result<($($ty::Output,)*), Box<dyn Any + Send + 'static>>;
 
-            fn poll(&mut self) -> thread::Result<Async<Self::Item>> {
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
                 #![allow(non_snake_case)]
 
                 let ($(ref mut $ty,)*) = self.children;
                 $({
                     let (ref mut spawn_complete, ref mut result) = *$ty;
                     if result.is_none() {
-                        match spawn_complete.poll()? {
-                            Async::Ready(val) => {
+                        match Pin::new(spawn_complete).poll(cx) {
+                            Poll::Ready(Ok(val)) => {
                                 *result = Some(val);
-                            },
-                            Async::NotReady => {
-                                return Ok(Async::NotReady);
-                            },
+                            }
+                            Poll::Pending => {
+                                return Poll::Pending;
+                            }
+                            Poll::Ready(Err(err)) => {
+                                return Poll::Ready(Err(err))
+                            }
                         }
                     }
                 })*
@@ -112,29 +122,28 @@ macro_rules! tuple_impl {
                     let $ty = unwrap!(result.take());
                 )*
 
-                Ok(Async::Ready(($($ty,)*)))
+                Poll::Ready(Ok(($($ty,)*)))
             }
         }
     }
 }
 
-tuple_impl!();
 tuple_impl!(T0,);
-tuple_impl!(T0,T1,);
-tuple_impl!(T0,T1,T2,);
-tuple_impl!(T0,T1,T2,T3,);
-tuple_impl!(T0,T1,T2,T3,T4,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,);
+tuple_impl!(T0, T1,);
+tuple_impl!(T0, T1, T2,);
+tuple_impl!(T0, T1, T2, T3,);
+tuple_impl!(T0, T1, T2, T3, T4,);
+tuple_impl!(T0, T1, T2, T3, T4, T5,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15,);
 
 /// A `Node` representing an ethernet hub.
 pub struct HubNode<C> {
@@ -149,6 +158,7 @@ pub fn hub<C: HubClients>(clients: C) -> HubNode<C> {
 impl<C> EtherNode for HubNode<C>
 where
     C: HubClients,
+    C::Output: Unpin,
 {
     type Output = C::Output;
 
@@ -161,4 +171,3 @@ where
         self.clients.build(handle, ipv4_range, ipv6_range)
     }
 }
-

@@ -1,4 +1,7 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::PacketLoss;
+use crate::wire::Ipv6Plug;
+use std::time::Duration;
 
 /// Adds packet loss to an IPv6 connection
 pub struct Ipv6PacketLoss {
@@ -14,7 +17,12 @@ impl Ipv6PacketLoss {
         plug_a: Ipv6Plug,
         plug_b: Ipv6Plug,
     ) {
-        PacketLoss::spawn(handle, loss_rate, mean_loss_duration, plug_a.into(), plug_b.into())
+        PacketLoss::spawn(
+            handle,
+            loss_rate,
+            mean_loss_duration,
+            plug_a.into(),
+            plug_b.into(),
+        )
     }
 }
-

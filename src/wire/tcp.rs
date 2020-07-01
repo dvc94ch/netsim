@@ -1,5 +1,9 @@
-use crate::priv_prelude::*;
-use super::*;
+use super::checksum;
+use crate::util::bytes_mut::BytesMutExt;
+use async_std::net::{Ipv4Addr, Ipv6Addr};
+use byteorder::{ByteOrder, NetworkEndian};
+use bytes::{Bytes, BytesMut};
+use std::fmt;
 
 /// A TCP packet
 #[derive(Clone, PartialEq)]
@@ -18,7 +22,6 @@ pub struct SelectiveAck {
 
 impl fmt::Debug for TcpPacket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-
         struct Kind(pub u16);
         impl fmt::Debug for Kind {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -58,13 +61,12 @@ impl fmt::Debug for TcpPacket {
 
         let mut ds = f.debug_struct("TcpPacket");
 
-        ds
-        .field("source_port", &self.source_port())
-        .field("dest_port", &self.dest_port())
-        .field("seq_num", &self.seq_num())
-        .field("ack_num", &self.ack_num())
-        .field("window_size", &self.window_size())
-        .field("kind", &kind);
+        ds.field("source_port", &self.source_port())
+            .field("dest_port", &self.dest_port())
+            .field("seq_num", &self.seq_num())
+            .field("ack_num", &self.ack_num())
+            .field("window_size", &self.window_size())
+            .field("kind", &kind);
         if let Some(ptr) = self.urgent() {
             ds.field("urgent", &ptr);
         }
@@ -87,9 +89,7 @@ impl fmt::Debug for TcpPacket {
             ds.field("echo_timestamp", &echo_timestamp);
         }
 
-        ds
-        .field("payload", &payload)
-        .finish()
+        ds.field("payload", &payload).finish()
     }
 }
 
@@ -139,16 +139,16 @@ pub struct TcpFields {
 impl TcpFields {
     /// Get the length of the header described by this `TcpFields`
     pub fn header_len(&self) -> usize {
-        (if self.mss.is_some() { 4 } else { 0 }) +
-        (if self.window_scale.is_some() { 3 } else { 0 }) +
-        (if self.selective_ack_permitted { 2 } else { 0 }) +
-        (if let Some(ref selective_acks) = self.selective_acks {
-            2 + selective_acks.len() * 8
-        } else {
-            0
-        }) +
-        (if self.timestamps.is_some() { 10 } else { 0 }) +
-        20
+        (if self.mss.is_some() { 4 } else { 0 })
+            + (if self.window_scale.is_some() { 3 } else { 0 })
+            + (if self.selective_ack_permitted { 2 } else { 0 })
+            + (if let Some(ref selective_acks) = self.selective_acks {
+                2 + selective_acks.len() * 8
+            } else {
+                0
+            })
+            + (if self.timestamps.is_some() { 10 } else { 0 })
+            + 20
     }
 }
 
@@ -157,19 +157,16 @@ fn set_fields(buffer: &mut [u8], fields: &TcpFields) {
     NetworkEndian::write_u16(&mut buffer[2..4], fields.dest_port);
     NetworkEndian::write_u32(&mut buffer[4..8], fields.seq_num);
     NetworkEndian::write_u32(&mut buffer[8..12], fields.ack_num);
-    buffer[12] = {
-        (((fields.header_len() / 4) as u8) << 4) |
-        if fields.ns { 0x01 } else { 0 }
-    };
+    buffer[12] = (((fields.header_len() / 4) as u8) << 4) | if fields.ns { 0x01 } else { 0 };
     buffer[13] = {
-        (if fields.fin { 0x01 } else { 0 }) |
-        (if fields.syn { 0x02 } else { 0 }) |
-        (if fields.rst { 0x04 } else { 0 }) |
-        (if fields.psh { 0x08 } else { 0 }) |
-        (if fields.ack { 0x10 } else { 0 }) |
-        (if fields.urgent.is_some() { 0x20 } else { 0 }) |
-        (if fields.ece { 0x40 } else { 0 }) |
-        (if fields.cwr { 0x80 } else { 0 })
+        (if fields.fin { 0x01 } else { 0 })
+            | (if fields.syn { 0x02 } else { 0 })
+            | (if fields.rst { 0x04 } else { 0 })
+            | (if fields.psh { 0x08 } else { 0 })
+            | (if fields.ack { 0x10 } else { 0 })
+            | (if fields.urgent.is_some() { 0x20 } else { 0 })
+            | (if fields.ece { 0x40 } else { 0 })
+            | (if fields.cwr { 0x80 } else { 0 })
     };
     NetworkEndian::write_u16(&mut buffer[14..16], fields.window_size);
     NetworkEndian::write_u16(&mut buffer[16..18], 0);
@@ -226,12 +223,7 @@ fn set_fields_v4(buffer: &mut [u8], fields: &TcpFields, source_ip: Ipv4Addr, des
     set_fields(&mut buffer[..header_len], fields);
 
     let checksum = !checksum::combine(&[
-        checksum::pseudo_header_ipv4(
-            source_ip,
-            dest_ip,
-            6,
-            buffer.len() as u32,
-        ),
+        checksum::pseudo_header_ipv4(source_ip, dest_ip, 6, buffer.len() as u32),
         checksum::data(&buffer[..]),
     ]);
     NetworkEndian::write_u16(&mut buffer[16..18], checksum);
@@ -242,12 +234,7 @@ fn set_fields_v6(buffer: &mut [u8], fields: &TcpFields, source_ip: Ipv6Addr, des
     set_fields(&mut buffer[..header_len], fields);
 
     let checksum = !checksum::combine(&[
-        checksum::pseudo_header_ipv6(
-            source_ip,
-            dest_ip,
-            6,
-            buffer.len() as u32,
-        ),
+        checksum::pseudo_header_ipv6(source_ip, dest_ip, 6, buffer.len() as u32),
         checksum::data(&buffer[..]),
     ]);
     NetworkEndian::write_u16(&mut buffer[16..18], checksum);
@@ -293,7 +280,7 @@ impl TcpPacket {
         payload: &Bytes,
     ) {
         let start = fields.header_len();
-        buffer[start..].clone_from_slice(payload);
+        buffer[start..].copy_from_slice(payload);
         set_fields_v4(buffer, fields, source_ip, dest_ip);
     }
 
@@ -306,7 +293,7 @@ impl TcpPacket {
         payload: &Bytes,
     ) {
         let start = fields.header_len();
-        buffer[start..].clone_from_slice(payload);
+        buffer[start..].copy_from_slice(payload);
         set_fields_v6(buffer, fields, source_ip, dest_ip);
     }
 
@@ -337,23 +324,19 @@ impl TcpPacket {
 
     /// Parse a TCP packet from a byte buffer
     pub fn from_bytes(buffer: Bytes) -> TcpPacket {
-        TcpPacket {
-            buffer,
-        }
+        TcpPacket { buffer }
     }
 
     /// Set the header fields of a TCP packet
     pub fn set_fields_v4(&mut self, fields: &TcpFields, source_ip: Ipv4Addr, dest_ip: Ipv4Addr) {
-        let buffer = mem::replace(&mut self.buffer, Bytes::new());
-        let mut buffer = BytesMut::from(buffer);
+        let mut buffer = BytesMut::from(&self.buffer[..]);
         set_fields_v4(&mut buffer, fields, source_ip, dest_ip);
         self.buffer = buffer.freeze();
     }
 
     /// Set the header fields of a TCP packet
     pub fn set_fields_v6(&mut self, fields: &TcpFields, source_ip: Ipv6Addr, dest_ip: Ipv6Addr) {
-        let buffer = mem::replace(&mut self.buffer, Bytes::new());
-        let mut buffer = BytesMut::from(buffer);
+        let mut buffer = BytesMut::from(&self.buffer[..]);
         set_fields_v6(&mut buffer, fields, source_ip, dest_ip);
         self.buffer = buffer.freeze();
     }
@@ -431,7 +414,7 @@ impl TcpPacket {
                         pos += 8;
                     }
                     return Some(ret);
-                },
+                }
                 _ => pos += self.buffer[pos + 1] as usize,
             }
         }
@@ -527,13 +510,12 @@ impl TcpPacket {
 
     /// Get the packet's payload data
     pub fn payload(&self) -> Bytes {
-        let header_len = self.header_len();
-        self.buffer.slice_from(header_len)
+        Bytes::copy_from_slice(&self.buffer[self.header_len()..])
     }
 
     /// Get the entire packet as a raw byte buffer.
-    pub fn as_bytes(&self) -> &Bytes {
-        &self.buffer
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer[..]
     }
 
     /// Consume the packet and return the underlying buffer
@@ -543,11 +525,7 @@ impl TcpPacket {
 
     /// Verify the checksum of the packet. The source/destination IP addresses of the packet are
     /// needed to calculate the checksum.
-    pub fn verify_checksum_v4(
-        &self,
-        source_ip: Ipv4Addr,
-        dest_ip: Ipv4Addr,
-    ) -> bool {
+    pub fn verify_checksum_v4(&self, source_ip: Ipv4Addr, dest_ip: Ipv4Addr) -> bool {
         let len = self.buffer.len();
         !0 == checksum::combine(&[
             checksum::pseudo_header_ipv4(source_ip, dest_ip, 6, len as u32),
@@ -557,11 +535,7 @@ impl TcpPacket {
 
     /// Verify the checksum of the packet. The source/destination IP addresses of the packet are
     /// needed to calculate the checksum.
-    pub fn verify_checksum_v6(
-        &self,
-        source_ip: Ipv6Addr,
-        dest_ip: Ipv6Addr,
-    ) -> bool {
+    pub fn verify_checksum_v6(&self, source_ip: Ipv6Addr, dest_ip: Ipv6Addr) -> bool {
         let len = self.buffer.len();
         !0 == checksum::combine(&[
             checksum::pseudo_header_ipv6(source_ip, dest_ip, 6, len as u32),
@@ -569,4 +543,3 @@ impl TcpPacket {
         ])
     }
 }
-

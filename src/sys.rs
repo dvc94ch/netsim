@@ -7,7 +7,7 @@
 #![cfg_attr(feature="cargo-clippy", allow(expl_impl_clone_on_copy))]
 #![cfg_attr(feature="cargo-clippy", allow(zero_ptr))]
 
-pub use libc::*;
+use libc::*;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -41,16 +41,10 @@ pub struct ifreq {
 }
 
 pub fn errno() -> ::std::os::raw::c_int {
-    unsafe {
-        *__errno_location()
-    }
+    unsafe { *__errno_location() }
 }
 
-
-
 // NOTE: everything under here should be obsolete as soon as PRs to libc are merged and published
-
-
 
 pub const SIOCADDRT: ::std::os::raw::c_uint = 35083;
 
@@ -113,4 +107,3 @@ pub struct rtattr {
 
 pub const RTM_NEWADDR: u16 = 20;
 pub const IFA_ADDRESS: u16 = 1;
-

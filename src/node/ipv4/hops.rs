@@ -1,4 +1,8 @@
-use crate::priv_prelude::*;
+use super::Ipv4Node;
+use crate::network::NetworkHandle;
+use crate::range::Ipv4Range;
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::Ipv4Plug;
 
 /// A node representing hops between Ipv4 nodes.
 pub struct HopsNode<N> {
@@ -31,4 +35,3 @@ where
         (spawn_complete, plug)
     }
 }
-

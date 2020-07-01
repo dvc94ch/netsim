@@ -1,4 +1,15 @@
-use crate::priv_prelude::*;
+use crate::iface::IpIface;
+use crate::wire::{IpPacket, IpPlug, IpReceiver, IpSender};
+use async_timer::timer::{PosixTimer as Timer, Timer as _};
+use futures::future::Future;
+use futures::sink::Sink;
+use futures::stream::Stream;
+use std::mem;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 pub struct TunTask {
     tun: IpIface,
@@ -9,11 +20,7 @@ pub struct TunTask {
 }
 
 impl TunTask {
-    pub fn new(
-        tun: IpIface,
-        plug: IpPlug,
-        drop_rx: DropNotice,
-    ) -> TunTask {
+    pub fn new(tun: IpIface, plug: IpPlug, exit: Arc<AtomicBool>) -> TunTask {
         trace!("TunTask: creating");
         let (tx, rx) = plug.split();
         TunTask {
@@ -21,122 +28,111 @@ impl TunTask {
             packet_tx: tx,
             packet_rx: rx,
             sending_packet: None,
-            state: TunTaskState::Receiving { drop_rx },
+            state: TunTaskState::Receiving { exit },
         }
     }
 }
 
 enum TunTaskState {
-    Receiving {
-        drop_rx: DropNotice,
-    },
-    Dying(Delay),
+    Receiving { exit: Arc<AtomicBool> },
+    Dying(Timer),
     Invalid,
 }
 
 impl Future for TunTask {
-    type Item = ();
-    type Error = Void;
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         trace!("TunTask: polling");
-        let grace_period: Duration = Duration::from_millis(100);
+        let grace_period = Duration::from_millis(100);
 
         let mut received_frames = false;
         loop {
-            match self.tun.poll() {
-                Ok(Async::Ready(Some(frame))) => {
+            match Pin::new(&mut self.tun).poll_next(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
                     self.packet_tx.unbounded_send(frame);
                     received_frames = true;
-                },
-                Ok(Async::Ready(None)) => {
+                }
+                Poll::Ready(None) => {
                     panic!("TAP stream ended somehow");
-                },
-                Ok(Async::NotReady) => break,
-                Err(e) => {
+                }
+                Poll::Pending => break,
+                Poll::Ready(Some(Err(e))) => {
                     panic!("reading TAP device yielded an error: {}", e);
-                },
+                }
             }
         }
 
         loop {
             trace!("TunTask: looping receiver ...");
-            if let Some(frame) = self.sending_packet.take() {
+            if self.sending_packet.is_some() {
                 trace!("TunTask: we have a frame ready to send");
-                match self.tun.start_send(frame) {
-                    Ok(AsyncSink::Ready) => (),
-                    Ok(AsyncSink::NotReady(frame)) => {
+                match Pin::new(&mut self.tun).poll_ready(cx) {
+                    Poll::Ready(Ok(())) => {
+                        if let Some(frame) = self.sending_packet.take() {
+                            if let Err(e) = Pin::new(&mut self.tun).start_send(frame) {
+                                panic!("completing TAP device write yielded an error: {}", e);
+                            }
+                        }
+                    }
+                    Poll::Pending => {
                         trace!("TunTask: couldn't send the frame ;(");
-                        self.sending_packet = Some(frame);
                         break;
-                    },
-                    Err(e) => {
+                    }
+                    Poll::Ready(Err(e)) => {
                         panic!("writing TAP device yielded an error: {}", e);
-                    },
+                    }
                 }
             }
 
-            match self.packet_rx.poll().void_unwrap() {
-                Async::Ready(Some(frame)) => {
-                    trace!("TunTask: we received a frame");
-                    self.sending_packet = Some(frame);
-                    continue;
-                },
-                _ => break,
+            if self.sending_packet.is_none() {
+                match Pin::new(&mut self.packet_rx).poll_next(cx) {
+                    Poll::Ready(Some(frame)) => {
+                        trace!("TunTask: we received a frame");
+                        self.sending_packet = Some(frame);
+                        continue;
+                    }
+                    _ => break,
+                }
             }
         }
         trace!("TunTask: done looping receiver");
 
-        match self.tun.poll_complete() {
-            Ok(..) => (),
-            Err(e) => {
-                panic!("completing TAP device write yielded an error: {}", e);
-            },
-        }
-
         let mut state = mem::replace(&mut self.state, TunTaskState::Invalid);
         loop {
             match state {
-                TunTaskState::Receiving {
-                    mut drop_rx,
-                } => {
+                TunTaskState::Receiving { ref exit } => {
                     trace!("TunTask: state == receiving");
-                    match drop_rx.poll().void_unwrap() {
-                        Async::Ready(()) => {
-                            state = TunTaskState::Dying(Delay::new(Instant::now() + grace_period));
-                            continue;
-                        },
-                        Async::NotReady => {
-                            state = TunTaskState::Receiving { drop_rx };
-                            break;
-                        },
+                    if exit.load(Ordering::Relaxed) {
+                        state = TunTaskState::Dying(Timer::new(grace_period));
+                        continue;
+                    } else {
+                        break;
                     }
-                },
+                }
                 TunTaskState::Dying(mut timeout) => {
                     trace!("TunTask: state == dying");
                     if received_frames {
-                        timeout.reset(Instant::now() + grace_period);
+                        timeout.restart(grace_period);
                     }
-                    match timeout.poll().void_unwrap() {
-                        Async::Ready(()) => {
-                            return Ok(Async::Ready(()));
-                        },
-                        Async::NotReady => {
+                    match Pin::new(&mut timeout).poll(cx) {
+                        Poll::Ready(()) => {
+                            return Poll::Ready(());
+                        }
+                        Poll::Pending => {
                             state = TunTaskState::Dying(timeout);
                             break;
-                        },
+                        }
                     }
                 }
                 TunTaskState::Invalid => {
                     panic!("TunTask in invalid state!");
-                },
+                }
             }
         }
         self.state = state;
 
         trace!("TunTask: exiting");
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
-
-

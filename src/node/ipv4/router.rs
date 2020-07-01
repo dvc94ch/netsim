@@ -1,5 +1,17 @@
-use crate::priv_prelude::*;
-use crate::spawn_complete;
+use super::Ipv4Node;
+use crate::device::ipv4::Ipv4RouterBuilder;
+use crate::network::NetworkHandle;
+use crate::range::Ipv4Range;
+use crate::route::Ipv4Route;
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::Ipv4Plug;
+use futures::channel::oneshot;
+use futures::future::Future;
+use futures::stream::{FuturesOrdered, TryStreamExt};
+use std::any::Any;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// A set of clients that can be attached to a router node.
 pub trait Ipv4RouterClients {
@@ -7,7 +19,11 @@ pub trait Ipv4RouterClients {
     type Output: Send + 'static;
 
     /// Build the set of nodes.
-    fn build(self, handle: &NetworkHandle, ipv4_range: Ipv4Range) -> (SpawnComplete<Self::Output>, Ipv4Plug);
+    fn build(
+        self,
+        handle: &NetworkHandle,
+        ipv4_range: Ipv4Range,
+    ) -> (SpawnComplete<Self::Output>, Ipv4Plug);
 }
 
 struct JoinAll<X, T> {
@@ -19,10 +35,10 @@ macro_rules! tuple_impl {
     ($($ty:ident,)*) => {
         impl<$($ty),*> Ipv4RouterClients for ($($ty,)*)
         where
-            $($ty: Ipv4Node + Send + 'static,)*
+            $($ty: Ipv4Node + Unpin + Send + 'static,)*
         {
             type Output = ($($ty::Output,)*);
-            
+
             fn build(self, handle: &NetworkHandle, ipv4_range: Ipv4Range) -> (SpawnComplete<Self::Output>, Ipv4Plug) {
                 #![allow(non_snake_case)]
                 #![allow(unused_assignments)]
@@ -45,21 +61,21 @@ macro_rules! tuple_impl {
                     let router = router.connect(plug, vec![Ipv4Route::new(ranges[i], None)]);
                     i += 1;
                 )*
-                
+
                 let (plug_0, plug_1) = Ipv4Plug::new_pair();
                 let router = router.connect(plug_1, vec![Ipv4Route::new(Ipv4Range::global(), None)]);
                 router.spawn(handle);
 
                 let (ret_tx, ret_rx) = oneshot::channel();
-                handle.spawn({
-                    JoinAll { phantoms: PhantomData::<($($ty,)*)>, children: ($(($ty, None),)*) }
-                    .then(|result| {
-                        let _ = ret_tx.send(result);
-                        Ok(())
-                    })
-                });
+                handle.spawn(Box::pin(async move {
+                    let res = JoinAll {
+                        phantoms: PhantomData::<($($ty,)*)>,
+                        children: ($(($ty, None),)*)
+                    }.await;
+                    let _ = ret_tx.send(res);
+                }));
 
-                let spawn_complete = spawn_complete::from_receiver(ret_rx);
+                let spawn_complete = SpawnComplete::from_receiver(ret_rx);
 
                 (spawn_complete, plug_0)
             }
@@ -67,25 +83,27 @@ macro_rules! tuple_impl {
 
         impl<$($ty),*> Future for JoinAll<($($ty,)*), ($((SpawnComplete<$ty::Output>, Option<$ty::Output>),)*)>
         where
-            $($ty: Ipv4Node + 'static,)*
+            $($ty: Ipv4Node + Unpin + 'static,)*
         {
-            type Item = ($($ty::Output,)*);
-            type Error = Box<Any + Send + 'static>;
+            type Output = Result<($($ty::Output,)*), Box<dyn Any + Send + 'static>>;
 
-            fn poll(&mut self) -> thread::Result<Async<Self::Item>> {
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
                 #![allow(non_snake_case)]
 
                 let ($(ref mut $ty,)*) = self.children;
                 $({
                     let (ref mut spawn_complete, ref mut result) = *$ty;
                     if result.is_none() {
-                        match spawn_complete.poll()? {
-                            Async::Ready(val) => {
+                        match Pin::new(spawn_complete).poll(cx) {
+                            Poll::Ready(Ok(val)) => {
                                 *result = Some(val);
-                            },
-                            Async::NotReady => {
-                                return Ok(Async::NotReady);
-                            },
+                            }
+                            Poll::Pending => {
+                                return Poll::Pending;
+                            }
+                            Poll::Ready(Err(err)) => {
+                                return Poll::Ready(Err(err))
+                            }
                         }
                     }
                 })*
@@ -95,33 +113,32 @@ macro_rules! tuple_impl {
                     let $ty = unwrap!(result.take());
                 )*
 
-                Ok(Async::Ready(($($ty,)*)))
+                Poll::Ready(Ok(($($ty,)*)))
             }
         }
     }
 }
 
-tuple_impl!();
 tuple_impl!(T0,);
-tuple_impl!(T0,T1,);
-tuple_impl!(T0,T1,T2,);
-tuple_impl!(T0,T1,T2,T3,);
-tuple_impl!(T0,T1,T2,T3,T4,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,);
-tuple_impl!(T0,T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,);
+tuple_impl!(T0, T1,);
+tuple_impl!(T0, T1, T2,);
+tuple_impl!(T0, T1, T2, T3,);
+tuple_impl!(T0, T1, T2, T3, T4,);
+tuple_impl!(T0, T1, T2, T3, T4, T5,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14,);
+tuple_impl!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15,);
 
 impl<N> Ipv4RouterClients for Vec<N>
 where
-    N: Ipv4Node + 'static,
+    N: Ipv4Node + Unpin + 'static,
 {
     type Output = Vec<N::Output>;
 
@@ -145,16 +162,12 @@ where
         router.spawn(handle);
 
         let (tx, rx) = oneshot::channel();
-        handle.spawn({
-            spawn_completes
-            .collect()
-            .then(|result| {
-                let _ = tx.send(result);
-                Ok(())
-            })
-        });
+        handle.spawn(Box::pin(async move {
+            let res = spawn_completes.try_collect::<Vec<_>>().await;
+            let _ = tx.send(res);
+        }));
 
-        let spawn_complete = spawn_complete::from_receiver(rx);
+        let spawn_complete = SpawnComplete::from_receiver(rx);
 
         (spawn_complete, plug_0)
     }
@@ -173,6 +186,7 @@ pub fn router<C: Ipv4RouterClients>(clients: C) -> RouterNode<C> {
 impl<C> Ipv4Node for RouterNode<C>
 where
     C: Ipv4RouterClients,
+    C::Output: Unpin,
 {
     type Output = C::Output;
 
@@ -184,4 +198,3 @@ where
         self.clients.build(handle, ipv4_range)
     }
 }
-

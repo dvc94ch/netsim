@@ -1,4 +1,9 @@
-use crate::priv_prelude::*;
+use super::Ipv6Node;
+use crate::network::NetworkHandle;
+use crate::range::Ipv6Range;
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::Ipv6Plug;
+use std::time::Duration;
 
 /// A node representing latency on an Ipv6 connection.
 pub struct LatencyNode<N> {
@@ -21,7 +26,11 @@ pub fn latency<N>(
 where
     N: Ipv6Node,
 {
-    LatencyNode { node, min_latency, mean_additional_latency }
+    LatencyNode {
+        node,
+        min_latency,
+        mean_additional_latency,
+    }
 }
 
 impl<N> Ipv6Node for LatencyNode<N>
@@ -40,4 +49,3 @@ where
         (spawn_complete, plug)
     }
 }
-

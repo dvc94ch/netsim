@@ -1,4 +1,13 @@
-use crate::priv_prelude::*;
+use super::Ipv4Node;
+use crate::device::MachineBuilder;
+use crate::iface::IpIfaceBuilder;
+use crate::network::NetworkHandle;
+use crate::range::Ipv4Range;
+use crate::route::Ipv4Route;
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::{IpPlug, Ipv4Plug};
+use async_std::net::Ipv4Addr;
+use futures::future::Future;
 
 /// A node representing an Ipv4 machine.
 pub struct MachineNode<F> {
@@ -9,8 +18,8 @@ pub struct MachineNode<F> {
 /// namespace with a single interface in a separate thread of it's own.
 pub fn machine<T, F>(func: F) -> MachineNode<F>
 where
-    T: Future<Error = Void> + Send + 'static,
-    T::Item: Send + 'static,
+    T: Future + Send + 'static,
+    T::Output: Unpin + Send + 'static,
     F: FnOnce(Ipv4Addr) -> T + Send + 'static,
 {
     MachineNode { func }
@@ -18,29 +27,29 @@ where
 
 impl<T, F> Ipv4Node for MachineNode<F>
 where
-    T: Future<Error = Void> + Send + 'static,
-    T::Item: Send + 'static,
+    T: Future + Send + 'static,
+    T::Output: Unpin + Send + 'static,
     F: FnOnce(Ipv4Addr) -> T + Send + 'static,
 {
-    type Output = T::Item;
+    type Output = T::Output;
 
     fn build(
         self,
         handle: &NetworkHandle,
         ipv4_range: Ipv4Range,
-    ) -> (SpawnComplete<T::Item>, Ipv4Plug) {
+    ) -> (SpawnComplete<T::Output>, Ipv4Plug) {
         let address = ipv4_range.random_client_addr();
         let iface = {
             IpIfaceBuilder::new()
-            .ipv4_addr(address, ipv4_range.netmask_prefix_length())
-            .ipv4_route(Ipv4Route::new(Ipv4Range::global(), None))
+                .ipv4_addr(address, ipv4_range.netmask_prefix_length())
+                .ipv4_route(Ipv4Route::new(Ipv4Range::global(), None))
         };
         let (plug_a, plug_b) = IpPlug::new_pair();
 
         let spawn_complete = {
             MachineBuilder::new()
-            .add_ip_iface(iface, plug_b)
-            .spawn(handle, move || (self.func)(address))
+                .add_ip_iface(iface, plug_b)
+                .spawn(handle, move || (self.func)(address))
         };
 
         let plug_a = plug_a.into_ipv4_plug(handle);
@@ -52,16 +61,16 @@ where
 #[cfg(feature = "linux_host")]
 #[cfg(test)]
 mod test {
-    use crate::priv_prelude::*;
-    use std;
-    use rand;
-    use void;
-    use crate::spawn;
     use crate::node;
-    use tokio;
+    use crate::priv_prelude::*;
+    use crate::spawn;
     use future_utils;
-    use tokio::net::{UdpSocket, TcpStream};
     use futures::future::Loop;
+    use rand;
+    use std;
+    use tokio;
+    use tokio::net::{TcpStream, UdpSocket};
+    use void;
 
     #[test]
     fn test_udp() {
@@ -86,19 +95,19 @@ mod test {
                         let socket = unwrap!(UdpSocket::bind(&addr!("0.0.0.0:0")));
 
                         socket
-                        .send_dgram(buffer_out, &SocketAddr::V4(remote_addr))
-                        .map_err(|e| panic!("error sending dgram: {}", e))
-                        .and_then(move |(socket, buffer_out)| {
-                            trace!("waiting to receive reply");
-                            socket
-                            .recv_dgram([0u8; 8])
-                            .map_err(|e| panic!("error receiving dgram: {}", e))
-                            .map(move |(_socket, buffer_in, n, recv_addr)| {
-                                assert_eq!(n, 8);
-                                assert_eq!(recv_addr, SocketAddr::V4(remote_addr));
-                                assert_eq!(buffer_out, buffer_in);
+                            .send_dgram(buffer_out, &SocketAddr::V4(remote_addr))
+                            .map_err(|e| panic!("error sending dgram: {}", e))
+                            .and_then(move |(socket, buffer_out)| {
+                                trace!("waiting to receive reply");
+                                socket
+                                    .recv_dgram([0u8; 8])
+                                    .map_err(|e| panic!("error receiving dgram: {}", e))
+                                    .map(move |(_socket, buffer_in, n, recv_addr)| {
+                                        assert_eq!(n, 8);
+                                        assert_eq!(recv_addr, SocketAddr::V4(remote_addr));
+                                        assert_eq!(buffer_out, buffer_in);
+                                    })
                             })
-                        })
                     }),
                 );
 
@@ -106,44 +115,43 @@ mod test {
                 let iface_ip = unwrap!(ipv4_addr_rx.recv());
 
                 plug_rx
-                .into_future()
-                .map_err(|(v, _plug_rx)| void::unreachable(v))
-                .and_then(move |(packet_opt, _plug_rx)| {
-                    let packet = unwrap!(packet_opt);
-                    assert_eq!(packet.source_ip(), iface_ip);
-                    assert_eq!(packet.dest_ip(), remote_ip);
+                    .into_future()
+                    .map_err(|(v, _plug_rx)| void::unreachable(v))
+                    .and_then(move |(packet_opt, _plug_rx)| {
+                        let packet = unwrap!(packet_opt);
+                        assert_eq!(packet.source_ip(), iface_ip);
+                        assert_eq!(packet.dest_ip(), remote_ip);
 
-                    let udp = match packet.payload() {
-                        Ipv4Payload::Udp(udp) => udp,
-                        payload => panic!("unexpected packet payload: {:?}", payload),
-                    };
-                    assert_eq!(udp.dest_port(), remote_port);
-                    let iface_port = udp.source_port();
+                        let udp = match packet.payload() {
+                            Ipv4Payload::Udp(udp) => udp,
+                            payload => panic!("unexpected packet payload: {:?}", payload),
+                        };
+                        assert_eq!(udp.dest_port(), remote_port);
+                        let iface_port = udp.source_port();
 
-                    let reply_packet = Ipv4Packet::new_from_fields_recursive(
-                        Ipv4Fields {
-                            source_ip: remote_ip,
-                            dest_ip: iface_ip,
-                            ttl: 12,
-                        },
-                        Ipv4PayloadFields::Udp {
-                            fields: UdpFields {
-                                source_port: remote_addr.port(),
-                                dest_port: iface_port,
+                        let reply_packet = Ipv4Packet::new_from_fields_recursive(
+                            Ipv4Fields {
+                                source_ip: remote_ip,
+                                dest_ip: iface_ip,
+                                ttl: 12,
                             },
-                            payload: udp.payload(),
-                        },
-                    );
+                            Ipv4PayloadFields::Udp {
+                                fields: UdpFields {
+                                    source_port: remote_addr.port(),
+                                    dest_port: iface_port,
+                                },
+                                payload: udp.payload(),
+                            },
+                        );
 
-                    trace!("sending reply packet");
-                    plug_tx
-                    .send(reply_packet)
-                    .map_err(|_e| panic!("plug hung up!"))
-                    .and_then(move |_plug_tx| {
-                        spawn_complete
-                        .map_err(|e| panic::resume_unwind(e))
+                        trace!("sending reply packet");
+                        plug_tx
+                            .send(reply_packet)
+                            .map_err(|_e| panic!("plug hung up!"))
+                            .and_then(move |_plug_tx| {
+                                spawn_complete.map_err(|e| panic::resume_unwind(e))
+                            })
                     })
-                })
             }));
             res.void_unwrap()
         })
@@ -465,43 +473,44 @@ mod test {
                     },
                     Ipv4PayloadFields::Icmp {
                         kind: Icmpv4PacketKind::EchoRequest {
-                            id, seq_num,
+                            id,
+                            seq_num,
                             payload: payload.clone(),
                         },
                     },
                 );
 
-                tx
-                .send(ping)
-                .map_err(|_e| panic!("interface hung up!"))
-                .and_then(move |_tx| {
-                    rx
-                    .into_future()
-                    .map_err(|(v, _rx)| void::unreachable(v))
-                    .and_then(move |(packet_opt, _rx)| {
-                        let packet = unwrap!(packet_opt);
-                        let icmp = match packet.payload() {
-                            Ipv4Payload::Icmp(icmp) => icmp,
-                            payload => panic!("unexpected ipv4 payload kind in reply: {:?}", payload),
-                        };
-                        match icmp.kind() {
-                            Icmpv4PacketKind::EchoReply {
-                                id: reply_id,
-                                seq_num: reply_seq_num,
-                                payload: reply_payload,
-                            } => {
-                                assert_eq!(id, reply_id);
-                                assert_eq!(seq_num, reply_seq_num);
-                                assert_eq!(payload, reply_payload);
-                            },
-                            kind => panic!("unexpected ICMP reply kind: {:?}", kind),
-                        }
-                        drop(done_tx);
+                tx.send(ping)
+                    .map_err(|_e| panic!("interface hung up!"))
+                    .and_then(move |_tx| {
+                        rx.into_future()
+                            .map_err(|(v, _rx)| void::unreachable(v))
+                            .and_then(move |(packet_opt, _rx)| {
+                                let packet = unwrap!(packet_opt);
+                                let icmp = match packet.payload() {
+                                    Ipv4Payload::Icmp(icmp) => icmp,
+                                    payload => panic!(
+                                        "unexpected ipv4 payload kind in reply: {:?}",
+                                        payload
+                                    ),
+                                };
+                                match icmp.kind() {
+                                    Icmpv4PacketKind::EchoReply {
+                                        id: reply_id,
+                                        seq_num: reply_seq_num,
+                                        payload: reply_payload,
+                                    } => {
+                                        assert_eq!(id, reply_id);
+                                        assert_eq!(seq_num, reply_seq_num);
+                                        assert_eq!(payload, reply_payload);
+                                    }
+                                    kind => panic!("unexpected ICMP reply kind: {:?}", kind),
+                                }
+                                drop(done_tx);
 
-                        spawn_complete
-                        .map_err(|e| panic::resume_unwind(e))
+                                spawn_complete.map_err(|e| panic::resume_unwind(e))
+                            })
                     })
-                })
             }));
             res.void_unwrap()
         })

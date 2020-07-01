@@ -1,8 +1,17 @@
 //! Contains utilites for working with virtual (TAP) network interfaces.
 
-use crate::priv_prelude::*;
-use libc;
-use crate::iface::build::{IfaceBuilder, build};
+use crate::async_fd::AsyncFd;
+use crate::iface::build::{build, IfaceBuildError, IfaceBuilder};
+use crate::route::{Ipv4Route, Ipv6Route};
+use crate::wire::{EtherFrame, MacAddr};
+use async_std::net::{Ipv4Addr, Ipv6Addr};
+use bytes::Bytes;
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, IntoSink, ReadHalf, WriteHalf};
+use futures::sink::Sink;
+use futures::stream::Stream;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// This object can be used to set the configuration options for a `EtherIface` before creating the
 /// `EtherIface`
@@ -100,111 +109,77 @@ impl UnboundEtherIface {
     /// Bind the tap device to the event loop, creating a `EtherIface` which you can read/write ethernet
     /// frames with.
     pub fn bind(self) -> EtherIface {
-        let UnboundEtherIface { fd } = self;
-        let fd = PollEvented2::new(fd);
-        EtherIface { fd }
+        EtherIface::new(self.fd)
     }
 }
 
 /// A handle to a virtual (TAP) network interface. Can be used to read/write ethernet frames
 /// directly to the device.
 pub struct EtherIface {
-    fd: PollEvented2<AsyncFd>,
+    sink: IntoSink<WriteHalf<AsyncFd>, EtherFrame>,
+    reader: ReadHalf<AsyncFd>,
+}
+
+impl EtherIface {
+    fn new(fd: AsyncFd) -> Self {
+        let (reader, writer) = fd.split();
+        Self {
+            sink: writer.into_sink(),
+            reader,
+        }
+    }
 }
 
 impl Stream for EtherIface {
-    type Item = EtherFrame;
-    type Error = io::Error;
+    type Item = Result<EtherFrame, io::Error>;
 
-    fn poll(&mut self) -> io::Result<Async<Option<EtherFrame>>> {
-        if let Async::NotReady = self.fd.poll_read_ready(Ready::readable())? {
-            return Ok(Async::NotReady);
-        }
-
-        let mut buffer: [u8; libc::ETH_FRAME_LEN as usize] = unsafe {
-            mem::uninitialized()
-        };
-        match self.fd.read(&mut buffer[..]) {
-            Ok(0) => Ok(Async::Ready(None)),
-            Ok(n) => {
-
-                /*
-                'out: for i in 0.. {
-                    println!("");
-                    for j in 0..4 {
-                        let pos = i * 4 + j;
-                        if pos < n {
-                            print!("{:02x}", buffer[pos]);
-                        } else {
-                            break 'out;
-                        }
-                    }
-                }
-                println!("");
-                */
-
-                let bytes = Bytes::from(&buffer[..n]);
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let mut buffer = [0u8; libc::ETH_FRAME_LEN as usize];
+        match Pin::new(&mut self.reader).poll_read(cx, &mut buffer) {
+            Poll::Ready(Ok(0)) => Poll::Ready(None),
+            Poll::Ready(Ok(n)) => {
+                let bytes = Bytes::copy_from_slice(&buffer[..n]);
                 let frame = EtherFrame::from_bytes(bytes);
-                info!("TAP sending frame: {:?}", frame);
-                Ok(Async::Ready(Some(frame)))
-            },
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.fd.clear_read_ready(Ready::readable())?;
-                Ok(Async::NotReady)
-            },
-            Err(e) => Err(e),
+                info!("TAP received frame: {:?}", frame);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
         }
     }
 }
 
-impl Sink for EtherIface {
-    type SinkItem = EtherFrame;
-    type SinkError = io::Error;
+impl Sink<EtherFrame> for EtherIface {
+    type Error = io::Error;
 
-    fn start_send(&mut self, item: EtherFrame) -> io::Result<AsyncSink<EtherFrame>> {
-        info!("TAP received frame: {:?}", item);
-        if let Async::NotReady = self.fd.poll_write_ready()? {
-            return Ok(AsyncSink::NotReady(item));
-        }
-
-        /*
-        trace!("frame as bytes:");
-        for chunk in item.as_bytes().chunks(8) {
-            let mut s = String::new();
-            for b in chunk {
-                use std::fmt::Write;
-                write!(&mut s, " {:02x}", b).unwrap();
-            }
-            trace!("   {}", s);
-        }
-        */
-
-        match self.fd.write(item.as_bytes()) {
-            Ok(n) => assert_eq!(n, item.as_bytes().len()),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.fd.clear_write_ready()?;
-                return Ok(AsyncSink::NotReady(item));
-            }
-            Err(e) => return Err(e),
-        }
-        trace!("sent: {:?}", item);
-        Ok(AsyncSink::Ready)
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.sink).poll_ready(cx)
     }
 
-    fn poll_complete(&mut self) -> io::Result<Async<()>> {
-        Ok(Async::Ready(()))
+    fn start_send(mut self: Pin<&mut Self>, item: EtherFrame) -> Result<(), Self::Error> {
+        info!("TAP sending frame: {:?}", item);
+        Pin::new(&mut self.sink).start_send(item)?;
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.sink).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.sink).poll_close(cx)
     }
 }
 
 #[cfg(feature = "linux_host")]
 #[cfg(test)]
 mod test {
+    use crate::iface;
     use crate::priv_prelude::*;
     use crate::spawn;
     use capabilities;
-    use rand;
-    use crate::iface;
     use get_if_addrs::{self, IfAddr};
+    use rand;
 
     #[test]
     fn build_tap_correct_settings() {
@@ -219,10 +194,10 @@ mod test {
 
                 let tap_builder = {
                     EtherIfaceBuilder::new()
-                    .mac_addr(mac_addr)
-                    .ipv4_addr(ipv4_addr, ipv4_netmask_bits)
-                    .ipv6_addr(ipv6_addr, ipv6_netmask_bits)
-                    .name(name.clone())
+                        .mac_addr(mac_addr)
+                        .ipv4_addr(ipv4_addr, ipv4_netmask_bits)
+                        .ipv6_addr(ipv6_addr, ipv6_netmask_bits)
+                        .name(name.clone())
                 };
 
                 let tap = unwrap!(tap_builder.build_unbound());
@@ -246,7 +221,7 @@ mod test {
                             );
 
                             found_v4 = true;
-                        },
+                        }
                         IfAddr::V6(ref ifv6_addr) => {
                             assert!(!found_v6);
                             assert_eq!(ifv6_addr.ip, ipv6_addr);
@@ -256,7 +231,7 @@ mod test {
                             );
 
                             found_v6 = true;
-                        },
+                        }
                     }
                 }
                 assert!(found_v4 && found_v6);
@@ -273,8 +248,8 @@ mod test {
         run_test(1, || {
             let tap_builder = {
                 EtherIfaceBuilder::new()
-                .ipv4_addr(Ipv4Addr::random_global(), 0)
-                .name("hello\0")
+                    .ipv4_addr(Ipv4Addr::random_global(), 0)
+                    .name("hello\0")
             };
             let res = tap_builder.build_unbound();
             match res {
@@ -290,16 +265,16 @@ mod test {
             let spawn_complete = spawn::new_namespace(|| {
                 let tap_builder = {
                     EtherIfaceBuilder::new()
-                    .ipv4_addr(Ipv4Addr::random_global(), 0)
-                    .name("hello")
+                        .ipv4_addr(Ipv4Addr::random_global(), 0)
+                        .name("hello")
                 };
                 trace!("build_tap_duplicate_name: building first interface");
                 let _tap = unwrap!(tap_builder.build_unbound());
 
                 let tap_builder = {
                     EtherIfaceBuilder::new()
-                    .ipv4_addr(Ipv4Addr::random_global(), 0)
-                    .name("hello")
+                        .ipv4_addr(Ipv4Addr::random_global(), 0)
+                        .name("hello")
                 };
                 trace!("build_tap_duplicate_name: building second interface");
                 match tap_builder.build_unbound() {
@@ -330,4 +305,3 @@ mod test {
         })
     }
 }
-

@@ -1,4 +1,8 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::wire::EtherPlug;
+use futures::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// Used to build a `Hub`
 #[derive(Default)]
@@ -40,43 +44,39 @@ pub struct Hub {
 impl Hub {
     /// Create a new ethernet hub with the given clients connected to it.
     pub fn new(connections: Vec<EtherPlug>) -> Hub {
-        Hub {
-            connections,
-        }
+        Hub { connections }
     }
 
     /// Spawn a new ethernet hub on the event loop.
     pub fn spawn(handle: &NetworkHandle, connections: Vec<EtherPlug>) {
         let hub = Hub::new(connections);
-        handle.spawn(hub.infallible());
+        handle.spawn(hub);
     }
 }
 
 impl Future for Hub {
-    type Item = ();
-    type Error = Void;
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut all_disconnected = true;
         for i in 0..self.connections.len() {
             all_disconnected &= loop {
-                match self.connections[i].poll_incoming() {
-                    Async::NotReady => break false,
-                    Async::Ready(None) => break true,
-                    Async::Ready(Some(packet)) => {
+                match self.connections[i].poll_incoming(cx) {
+                    Poll::Pending => break false,
+                    Poll::Ready(None) => break true,
+                    Poll::Ready(Some(packet)) => {
                         for connection in &mut self.connections {
                             let _ = connection.unbounded_send(packet.clone());
                         }
-                    },
+                    }
                 }
             };
         }
 
         if all_disconnected {
-            return Ok(Async::Ready(()));
+            return Poll::Ready(());
         }
 
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
-

@@ -1,4 +1,7 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::Latency;
+use crate::wire::Ipv4Plug;
+use std::time::Duration;
 
 /// Adds latency to an IPv4 connection
 pub struct Ipv4Latency {
@@ -19,7 +22,6 @@ impl Ipv4Latency {
         plug_a: Ipv4Plug,
         plug_b: Ipv4Plug,
     ) {
-
         Latency::spawn(
             handle,
             min_latency,
@@ -29,4 +31,3 @@ impl Ipv4Latency {
         )
     }
 }
-

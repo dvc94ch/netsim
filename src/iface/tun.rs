@@ -1,8 +1,17 @@
 //! Contains utilites for working with virtual (TUN) network interfaces.
 
-use crate::priv_prelude::*;
-use libc;
-use crate::iface::build::{IfaceBuilder, build};
+use crate::async_fd::AsyncFd;
+use crate::iface::build::{build, IfaceBuildError, IfaceBuilder};
+use crate::route::{Ipv4Route, Ipv6Route};
+use crate::wire::IpPacket;
+use async_std::net::{Ipv4Addr, Ipv6Addr};
+use bytes::Bytes;
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, IntoSink, ReadHalf, WriteHalf};
+use futures::sink::Sink;
+use futures::stream::Stream;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// This object can be used to set the configuration options for a `IpIface` before creating the
 /// `IpIface`
@@ -92,108 +101,64 @@ impl UnboundIpIface {
     /// Bind the tap device to the event loop, creating a `IpIface` which you can read/write ethernet
     /// frames with.
     pub fn bind(self) -> IpIface {
-        let UnboundIpIface { fd } = self;
-        let fd = PollEvented2::new(fd);
-        IpIface { fd }
+        IpIface::new(self.fd)
     }
 }
 
 /// A handle to a virtual (TUN) network interface. Can be used to read/write ethernet frames
 /// directly to the device.
 pub struct IpIface {
-    fd: PollEvented2<AsyncFd>,
+    sink: IntoSink<WriteHalf<AsyncFd>, IpPacket>,
+    reader: ReadHalf<AsyncFd>,
+}
+
+impl IpIface {
+    fn new(fd: AsyncFd) -> Self {
+        let (reader, writer) = fd.split();
+        Self {
+            sink: writer.into_sink(),
+            reader,
+        }
+    }
 }
 
 impl Stream for IpIface {
-    type Item = IpPacket;
+    type Item = Result<IpPacket, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let mut buffer = [0u8; libc::ETH_FRAME_LEN as usize];
+        match Pin::new(&mut self.reader).poll_read(cx, &mut buffer) {
+            Poll::Ready(Ok(0)) => Poll::Ready(None),
+            Poll::Ready(Ok(n)) => {
+                let bytes = Bytes::copy_from_slice(&buffer[..n]);
+                let frame = IpPacket::from_bytes(bytes);
+                info!("TUN received packet: {:?}", frame);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+impl Sink<IpPacket> for IpIface {
     type Error = io::Error;
-    
-    fn poll(&mut self) -> io::Result<Async<Option<IpPacket>>> {
-        loop {
-            if let Async::NotReady = self.fd.poll_read_ready(Ready::readable())? {
-                return Ok(Async::NotReady);
-            }
 
-            let mut buffer: [u8; libc::ETH_FRAME_LEN as usize] = unsafe {
-                mem::uninitialized()
-            };
-            match self.fd.read(&mut buffer[..]) {
-                Ok(0) => return Ok(Async::Ready(None)),
-                Ok(n) => {
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.sink).poll_ready(cx)
+    }
 
-                    /*
-                    'out: for i in 0.. {
-                        println!("");
-                        for j in 0..4 {
-                            let pos = i * 4 + j;
-                            if pos < n {
-                                print!("{:02x}", buffer[pos]);
-                            } else {
-                                break 'out;
-                            }
-                        }
-                    }
-                    println!("");
-                    */
+    fn start_send(mut self: Pin<&mut Self>, item: IpPacket) -> Result<(), Self::Error> {
+        info!("TUN sending packet: {:?}", item);
+        Pin::new(&mut self.sink).start_send(item)?;
+        Ok(())
+    }
 
-                    if buffer[0] >> 4 != 4 {
-                        info!("TUN dropping packet with version {}", buffer[0] >> 4);
-                        continue;
-                    }
-                    let bytes = Bytes::from(&buffer[..n]);
-                    let frame = IpPacket::from_bytes(bytes);
-                    info!("TUN emitting frame: {:?}", frame);
-                    return Ok(Async::Ready(Some(frame)));
-                },
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.fd.clear_read_ready(Ready::readable())?;
-                    return Ok(Async::NotReady);
-                },
-                Err(e) => return Err(e),
-            }
-        }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.sink).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.sink).poll_close(cx)
     }
 }
-
-impl Sink for IpIface {
-    type SinkItem = IpPacket;
-    type SinkError = io::Error;
-    
-    fn start_send(&mut self, item: IpPacket) -> io::Result<AsyncSink<IpPacket>> {
-        info!("TUN received frame: {:?}", item);
-        if let Async::NotReady = self.fd.poll_write_ready()? {
-            return Ok(AsyncSink::NotReady(item));
-        }
-
-        /*
-        trace!("frame as bytes:");
-        for chunk in item.as_bytes().chunks(8) {
-            let mut s = String::new();
-            for b in chunk {
-                use std::fmt::Write;
-                write!(&mut s, " {:02x}", b).unwrap();
-            }
-            trace!("   {}", s);
-        }
-        */
-
-        match self.fd.write(item.as_bytes()) {
-            Ok(n) => {
-                trace!("wrote {} bytes of TUN data to interface", n);
-                assert_eq!(n, item.as_bytes().len());
-            },
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.fd.clear_write_ready()?;
-                return Ok(AsyncSink::NotReady(item));
-            }
-            Err(e) => return Err(e),
-        }
-        trace!("sent: {:?}", item);
-        Ok(AsyncSink::Ready)
-    }
-
-    fn poll_complete(&mut self) -> io::Result<Async<()>> {
-        Ok(Async::Ready(()))
-    }
-}
-

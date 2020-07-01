@@ -1,4 +1,5 @@
-use crate::priv_prelude::*;
+use std::io;
+use thiserror::Error;
 
 mod v4;
 mod v6;
@@ -6,27 +7,16 @@ mod v6;
 pub use self::v4::*;
 pub use self::v6::*;
 
-quick_error! {
-    /// Errors returned by `add_route` and `Route::add`
-    #[allow(missing_docs)]
-    #[derive(Debug)]
-    pub enum AddRouteError {
-        /// Process file descriptor limit hit
-        ProcessFileDescriptorLimit(e: io::Error) {
-            description("process file descriptor limit hit")
-            display("process file descriptor limit hit ({})", e)
-            cause(e)
-        }
-        /// System file descriptor limit hit
-        SystemFileDescriptorLimit(e: io::Error) {
-            description("system file descriptor limit hit")
-            display("system file descriptor limit hit ({})", e)
-            cause(e)
-        }
-        /// Interface name contains an interior NUL byte
-        NameContainsNul {
-            description("interface name contains interior NUL byte")
-        }
-    }
+/// Errors returned by `add_route` and `Route::add`
+#[derive(Debug, Error)]
+pub enum AddRouteError {
+    /// Process file descriptor limit hit
+    #[error("process file descriptor limit hit ({0})")]
+    ProcessFileDescriptorLimit(io::Error),
+    /// System file descriptor limit hit
+    #[error("system file descriptor limit hit ({0})")]
+    SystemFileDescriptorLimit(io::Error),
+    /// Interface name contains an interior NUL byte
+    #[error("interface name contains interior NUL byte")]
+    NameContainsNul,
 }
-

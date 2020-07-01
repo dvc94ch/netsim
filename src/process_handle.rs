@@ -1,5 +1,4 @@
-use crate::priv_prelude::*;
-use libc;
+use std::{mem, ptr, thread};
 
 pub struct ProcessHandle {
     stack: Vec<u8>,
@@ -8,10 +7,7 @@ pub struct ProcessHandle {
 
 impl ProcessHandle {
     pub fn new(stack: Vec<u8>, child_tid: Box<libc::pid_t>) -> ProcessHandle {
-        ProcessHandle {
-            stack,
-            child_tid,
-        }
+        ProcessHandle { stack, child_tid }
     }
 
     pub fn busy_wait_for_exit(&mut self) {
@@ -34,4 +30,3 @@ impl Drop for ProcessHandle {
         mem::forget(stack);
     }
 }
-

@@ -1,4 +1,11 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::route::Ipv4Route;
+use crate::wire::{Ipv4Packet, Ipv4Plug, Ipv4Receiver, Ipv4Sender};
+use async_std::net::Ipv4Addr;
+use futures::future::Future;
+use futures::stream::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// Builder for creating a `Ipv4Router`.
 pub struct Ipv4RouterBuilder {
@@ -62,7 +69,7 @@ impl Ipv4Router {
         connections: Vec<(Ipv4Plug, Vec<Ipv4Route>)>,
     ) {
         let router_v4 = Ipv4Router::new(ipv4_addr, connections);
-        handle.spawn(router_v4.infallible());
+        handle.spawn(router_v4);
     }
 
     /// Checks if given packet, is destined to the router itself.
@@ -107,18 +114,17 @@ fn split_conn_plugs(
 }
 
 impl Future for Ipv4Router {
-    type Item = ();
-    type Error = Void;
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut all_disconnected = true;
         let mut rxs = unwrap!(self.rxs.take());
-        for rx in &mut rxs {
+        for mut rx in &mut rxs {
             all_disconnected &= loop {
-                match rx.poll().void_unwrap() {
-                    Async::NotReady => break false,
-                    Async::Ready(None) => break true,
-                    Async::Ready(Some(packet)) => {
+                match Pin::new(&mut rx).poll_next(cx) {
+                    Poll::Pending => break false,
+                    Poll::Ready(None) => break true,
+                    Poll::Ready(Some(packet)) => {
                         if !self.is_packet_to_me(&packet) {
                             let _ = self.send_packet(packet);
                         }
@@ -129,10 +135,10 @@ impl Future for Ipv4Router {
         self.rxs = Some(rxs);
 
         if all_disconnected {
-            return Ok(Async::Ready(()));
+            return Poll::Ready(());
         }
 
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
 

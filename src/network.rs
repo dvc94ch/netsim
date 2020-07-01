@@ -1,29 +1,31 @@
-use crate::priv_prelude::*;
-use future_utils;
-use std;
-use tokio;
+use crate::node::{Ipv4Node, Ipv6Node};
+use crate::range::{Ipv4Range, Ipv6Range};
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::{Ipv4Plug, Ipv6Plug};
+use futures::future::{poll_fn, Future};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::Poll;
 
 /// A `Network` manages a set of tasks/devices. Dropping the `Network` will destroy all associated
 /// tasks/devices.
 pub struct Network {
-    drop_tx_tx: std::sync::mpsc::Sender<DropNotify>,
-    _drop_tx_rx: std::sync::mpsc::Receiver<DropNotify>,
+    exit: Arc<AtomicBool>,
 }
 
 impl Network {
     /// Create a new `Network` running on the given event loop.
     pub fn new() -> Network {
-        let (drop_tx_tx, drop_tx_rx) = std::sync::mpsc::channel();
         Network {
-            drop_tx_tx,
-            _drop_tx_rx: drop_tx_rx,
+            exit: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Get a handle to the network. Can be used to spawn tasks to the network.
     pub fn handle(&self) -> NetworkHandle {
         NetworkHandle {
-            drop_tx_tx: self.drop_tx_tx.clone(),
+            exit: self.exit.clone(),
         }
     }
 
@@ -48,30 +50,35 @@ impl Network {
     }
 }
 
+impl Drop for Network {
+    fn drop(&mut self) {
+        self.exit.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 /// A handle to a `Network`
 pub struct NetworkHandle {
-    drop_tx_tx: std::sync::mpsc::Sender<DropNotify>,
+    exit: Arc<AtomicBool>,
 }
 
 impl NetworkHandle {
     /// Spawn a future to the event loop. The future will be cancelled when the `Network` is
     /// destroyed,
-    pub fn spawn<F>(&self, f: F)
+    pub fn spawn<F>(&self, mut f: F)
     where
-        F: Future<Item = (), Error = Void> + Send + 'static,
+        F: Future<Output = ()> + Unpin + Send + 'static,
     {
-        let (drop_tx, drop_rx) = future_utils::drop_notify();
-        if self.drop_tx_tx.send(drop_tx).is_err() {
-            panic!("network has been destroyed");
-        }
+        let exit = self.exit.clone();
 
-        tokio::spawn({
-            f
-            .until(drop_rx)
-            .map(|_unit_opt| ())
-            .infallible()
-        });
+        async_std::task::spawn(poll_fn(move |cx| {
+            while !exit.load(Ordering::Relaxed) {
+                if Pin::new(&mut f).poll(cx) == Poll::Pending {
+                    return Poll::Pending;
+                }
+            }
+            Poll::Ready(())
+        }));
     }
 
     /// Spawn a hierarchical network of nodes. The returned plug can be used to write packets to the

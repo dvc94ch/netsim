@@ -1,49 +1,49 @@
-use crate::priv_prelude::*;
-use mio::{Evented, Poll, Token, PollOpt, Ready};
-use mio::unix::EventedFd;
-use libc;
+use smol::Async;
+use std::io::{self, Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
+
+pub type AsyncFd = Async<Fd>;
 
 #[derive(Debug)]
-pub struct AsyncFd(RawFd);
+pub struct Fd(RawFd);
 
-impl AsyncFd {
-    pub fn new(fd: RawFd) -> io::Result<AsyncFd> {
+impl Fd {
+    pub fn new(fd: RawFd) -> io::Result<Self> {
         if fd < 0 {
             return Err(io::ErrorKind::InvalidInput.into());
         }
 
-        let flags = unsafe {
-            libc::fcntl(fd, libc::F_GETFL, 0)
-        };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if flags < 0 {
             return Err(io::Error::last_os_error());
         }
-    
-        let res = unsafe {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK)
-        };
+
+        let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(AsyncFd(fd))
+        Ok(Self(fd))
     }
 }
 
-impl Drop for AsyncFd {
+impl AsRawFd for Fd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for Fd {
     fn drop(&mut self) {
         unsafe {
-            let AsyncFd(fd) = *self;
-            libc::close(fd);
+            libc::close(self.as_raw_fd());
         }
     }
 }
 
-impl Read for AsyncFd {
+impl Read for Fd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let res = unsafe {
-            libc::read(self.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len())
-        };
+        let res = unsafe { libc::read(self.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -51,11 +51,9 @@ impl Read for AsyncFd {
     }
 }
 
-impl Write for AsyncFd {
+impl Write for Fd {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let res = unsafe {
-            libc::write(self.as_raw_fd(), buf.as_ptr() as *mut _, buf.len())
-        };
+        let res = unsafe { libc::write(self.as_raw_fd(), buf.as_ptr() as *mut _, buf.len()) };
         if res < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -66,51 +64,3 @@ impl Write for AsyncFd {
         Ok(())
     }
 }
-
-impl AsyncRead for AsyncFd {}
-
-impl AsyncWrite for AsyncFd {
-    fn shutdown(&mut self) -> io::Result<Async<()>> {
-        Ok(Async::Ready(()))
-    }
-}
-
-impl AsRawFd for AsyncFd {
-    fn as_raw_fd(&self) -> RawFd {
-        let AsyncFd(ret) = *self;
-        ret
-    }
-}
-
-impl Evented for AsyncFd {
-    fn register(
-        &self, 
-        poll: &Poll, 
-        token: Token, 
-        interest: Ready, 
-        opts: PollOpt
-    ) -> io::Result<()> {
-        let fd = self.as_raw_fd();
-        let evented_fd = EventedFd(&fd);
-        evented_fd.register(poll, token, interest, opts)
-    }
-
-    fn reregister(
-        &self, 
-        poll: &Poll, 
-        token: Token, 
-        interest: Ready, 
-        opts: PollOpt
-    ) -> io::Result<()> {
-        let fd = self.as_raw_fd();
-        let evented_fd = EventedFd(&fd);
-        evented_fd.reregister(poll, token, interest, opts)
-    }
-    
-    fn deregister(&self, poll: &Poll) -> io::Result<()> {
-        let fd = self.as_raw_fd();
-        let evented_fd = EventedFd(&fd);
-        evented_fd.deregister(poll)
-    }
-}
-

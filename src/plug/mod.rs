@@ -1,5 +1,11 @@
-use crate::priv_prelude::*;
-use future_utils;
+use crate::network::NetworkHandle;
+use futures::channel::mpsc::{self, SendError, UnboundedReceiver, UnboundedSender};
+use futures::sink::Sink;
+use futures::stream::Stream;
+use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 mod latency;
 mod packet_loss;
@@ -10,26 +16,20 @@ pub use self::packet_loss::*;
 #[derive(Debug)]
 /// Bidirectional network plug that can be used to exchange data between two devices.
 /// Anything written to the plub will be readable on the other side.
-pub struct Plug<T: fmt::Debug + 'static> {
+pub struct Plug<T: Unpin + fmt::Debug + 'static> {
     /// The sender
     pub tx: UnboundedSender<T>,
     /// The receiver.
     pub rx: UnboundedReceiver<T>,
 }
 
-impl<T: fmt::Debug + Send + 'static> Plug<T> {
+impl<T: Unpin + fmt::Debug + Send + 'static> Plug<T> {
     /// Create a new connection connecting the two returned plugs.
     pub fn new_pair() -> (Plug<T>, Plug<T>) {
-        let (a_tx, b_rx) = future_utils::mpsc::unbounded();
-        let (b_tx, a_rx) = future_utils::mpsc::unbounded();
-        let a = Plug {
-            tx: a_tx,
-            rx: a_rx,
-        };
-        let b = Plug {
-            tx: b_tx,
-            rx: b_rx,
-        };
+        let (a_tx, b_rx) = mpsc::unbounded();
+        let (b_tx, a_rx) = mpsc::unbounded();
+        let a = Plug { tx: a_tx, rx: a_rx };
+        let b = Plug { tx: b_tx, rx: b_rx };
         (a, b)
     }
 
@@ -69,25 +69,30 @@ impl<T: fmt::Debug + Send + 'static> Plug<T> {
     }
 }
 
-impl<T: fmt::Debug + 'static> Stream for Plug<T> {
+impl<T: Unpin + fmt::Debug + 'static> Stream for Plug<T> {
     type Item = T;
-    type Error = Void;
 
-    fn poll(&mut self) -> Result<Async<Option<T>>, Void> {
-        self.rx.poll()
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
     }
 }
 
-impl<T: fmt::Debug + 'static> Sink for Plug<T> {
-    type SinkItem = T;
-    type SinkError = Void;
+impl<T: Unpin + fmt::Debug + 'static> Sink<T> for Plug<T> {
+    type Error = SendError;
 
-    fn start_send(&mut self, item: T) -> Result<AsyncSink<T>, Void> {
-        Ok(self.tx.start_send(item).unwrap_or(AsyncSink::Ready))
+    fn start_send(mut self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        Pin::new(&mut self.tx).start_send(item)
     }
 
-    fn poll_complete(&mut self) -> Result<Async<()>, Void> {
-        Ok(self.tx.poll_complete().unwrap_or(Async::Ready(())))
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.tx).poll_ready(cx)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.tx).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.tx).poll_close(cx)
     }
 }
-

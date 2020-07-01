@@ -1,4 +1,16 @@
-use crate::priv_prelude::*;
+use crate::iface::EtherIface;
+use crate::wire::{EtherFrame, EtherPlug};
+use async_timer::timer::{PosixTimer as Timer, Timer as _};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::future::Future;
+use futures::sink::Sink;
+use futures::stream::Stream;
+use std::mem;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 pub struct TapTask {
     tap: EtherIface,
@@ -9,126 +21,112 @@ pub struct TapTask {
 }
 
 impl TapTask {
-    pub fn new(
-        tap: EtherIface,
-        plug: EtherPlug,
-        drop_rx: DropNotice,
-    ) -> TapTask {
+    pub fn new(tap: EtherIface, plug: EtherPlug, exit: Arc<AtomicBool>) -> TapTask {
         let (tx, rx) = plug.split();
         TapTask {
             tap,
             frame_tx: tx,
             frame_rx: rx,
             sending_frame: None,
-            state: TapTaskState::Receiving { drop_rx },
+            state: TapTaskState::Receiving { exit },
         }
     }
 }
 
 enum TapTaskState {
-    Receiving {
-        drop_rx: DropNotice,
-    },
-    Dying(Delay),
+    Receiving { exit: Arc<AtomicBool> },
+    Dying(Timer),
     Invalid,
 }
 
 impl Future for TapTask {
-    type Item = ();
-    type Error = Void;
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let grace_period: Duration = Duration::from_millis(100);
 
         let mut received_frames = false;
         loop {
-            match self.tap.poll() {
-                Ok(Async::Ready(Some(frame))) => {
+            match Pin::new(&mut self.tap).poll_next(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
                     let _ = self.frame_tx.unbounded_send(frame);
                     received_frames = true;
-                },
-                Ok(Async::Ready(None)) => {
+                }
+                Poll::Ready(None) => {
                     panic!("TAP stream ended somehow");
-                },
-                Ok(Async::NotReady) => break,
-                Err(e) => {
+                }
+                Poll::Pending => break,
+                Poll::Ready(Some(Err(e))) => {
                     panic!("reading TAP device yielded an error: {}", e);
-                },
+                }
             }
         }
 
         loop {
-            if let Some(frame) = self.sending_frame.take() {
-                match self.tap.start_send(frame) {
-                    Ok(AsyncSink::Ready) => (),
-                    Ok(AsyncSink::NotReady(frame)) => {
-                        self.sending_frame = Some(frame);
+            if self.sending_frame.is_some() {
+                match Pin::new(&mut self.tap).poll_ready(cx) {
+                    Poll::Ready(Ok(())) => {
+                        if let Some(frame) = self.sending_frame.take() {
+                            if let Err(e) = Pin::new(&mut self.tap).start_send(frame) {
+                                panic!("writing TAP device yielded an error: {}", e);
+                            }
+                        }
+                    }
+                    Poll::Pending => {
                         break;
-                    },
-                    Err(e) => {
-                        panic!("writing TAP device yielded an error: {}", e);
-                    },
+                    }
+                    Poll::Ready(Err(e)) => {
+                        panic!("completing TAP device write yielded an error: {}", e);
+                    }
                 }
             }
 
-            match self.frame_rx.poll().void_unwrap() {
-                Async::Ready(Some(frame)) => {
-                    self.sending_frame = Some(frame);
-                    continue;
-                },
-                _ => break,
+            if self.sending_frame.is_none() {
+                match Pin::new(&mut self.frame_rx).poll_next(cx) {
+                    Poll::Ready(Some(frame)) => {
+                        self.sending_frame = Some(frame);
+                        continue;
+                    }
+                    _ => break,
+                }
             }
-        }
-        match self.tap.poll_complete() {
-            Ok(..) => (),
-            Err(e) => {
-                panic!("completing TAP device write yielded an error: {}", e);
-            },
         }
 
         let mut state = mem::replace(&mut self.state, TapTaskState::Invalid);
         trace!("polling TapTask");
         loop {
             match state {
-                TapTaskState::Receiving {
-                    mut drop_rx,
-                } => {
+                TapTaskState::Receiving { ref exit } => {
                     trace!("state == receiving");
-                    match drop_rx.poll().void_unwrap() {
-                        Async::Ready(()) => {
-                            state = TapTaskState::Dying(Delay::new(Instant::now() + grace_period));
-                            continue;
-                        },
-                        Async::NotReady => {
-                            state = TapTaskState::Receiving { drop_rx };
-                            break;
-                        },
+                    if exit.load(Ordering::Relaxed) {
+                        state = TapTaskState::Dying(Timer::new(grace_period));
+                        continue;
+                    } else {
+                        break;
                     }
-                },
+                }
                 TapTaskState::Dying(mut timeout) => {
                     trace!("state == dying");
                     if received_frames {
-                        timeout.reset(Instant::now() + grace_period);
+                        timeout.restart(grace_period);
                     }
-                    match timeout.poll().void_unwrap() {
-                        Async::Ready(()) => {
-                            return Ok(Async::Ready(()));
-                        },
-                        Async::NotReady => {
+                    match Pin::new(&mut timeout).poll(cx) {
+                        Poll::Ready(()) => {
+                            return Poll::Ready(());
+                        }
+                        Poll::Pending => {
                             state = TapTaskState::Dying(timeout);
                             break;
-                        },
+                        }
                     }
                 }
                 TapTaskState::Invalid => {
                     panic!("TapTask in invalid state!");
-                },
+                }
             }
         }
         self.state = state;
 
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
-
-

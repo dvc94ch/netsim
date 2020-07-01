@@ -1,11 +1,14 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::range::Ipv6Range;
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::Ipv6Plug;
 
 mod latency;
-mod packet_loss;
 mod machine;
+mod packet_loss;
 pub use self::latency::{latency, LatencyNode};
-pub use self::packet_loss::{packet_loss, PacketLossNode};
 pub use self::machine::{machine, MachineNode};
+pub use self::packet_loss::{packet_loss, PacketLossNode};
 
 /// An `Ipv6Node` describes a recipe for constructing a network when given the IP range that the
 /// network should operate on. The functions in the `node::ipv6` module return `Ipv6Node`s that you
@@ -23,4 +26,3 @@ pub trait Ipv6Node: Sized {
         ipv6_range: Ipv6Range,
     ) -> (SpawnComplete<Self::Output>, Ipv6Plug);
 }
-

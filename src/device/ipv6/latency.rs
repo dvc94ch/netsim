@@ -1,4 +1,7 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::Latency;
+use crate::wire::Ipv6Plug;
+use std::time::Duration;
 
 /// Adds latency to an IPv6 connection
 pub struct Ipv6Latency {
@@ -19,7 +22,6 @@ impl Ipv6Latency {
         plug_a: Ipv6Plug,
         plug_b: Ipv6Plug,
     ) {
-
         Latency::spawn(
             handle,
             min_latency,
@@ -29,4 +31,3 @@ impl Ipv6Latency {
         )
     }
 }
-

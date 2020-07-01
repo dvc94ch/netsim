@@ -1,5 +1,6 @@
-use crate::priv_prelude::*;
-use rand;
+use crate::util::ipv6_addr::{Ipv6AddrClass, Ipv6AddrExt};
+use async_std::net::Ipv6Addr;
+use std::fmt;
 
 #[derive(Clone, Copy)]
 /// A range of IPv6 addresses with a common prefix
@@ -85,10 +86,7 @@ impl Ipv6Range {
                 n += 1;
                 continue;
             }
-            ret.push(Ipv6Range {
-                addr: ip,
-                bits: 0,
-            });
+            ret.push(Ipv6Range { addr: ip, bits: 0 });
             if ret.len() == num as usize {
                 break;
             }
@@ -121,14 +119,14 @@ impl Ipv6Range {
 
             let x = r & mask;
             if x < 2 {
-                continue
+                continue;
             }
             let addr = Ipv6Addr::from(u128::from(self.addr) | x);
             if class != addr.class() {
-                continue
+                continue;
             }
             return addr;
-        };
+        }
     }
 
     /// Get a default IP address for the range's next hop. This is one higher than the base address
@@ -137,4 +135,3 @@ impl Ipv6Range {
         Ipv6Addr::from(u128::from(self.addr) | 1)
     }
 }
-

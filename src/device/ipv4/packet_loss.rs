@@ -1,4 +1,7 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::PacketLoss;
+use crate::wire::Ipv4Plug;
+use std::time::Duration;
 
 /// Adds packet loss to an IPv4 connection
 pub struct Ipv4PacketLoss {
@@ -14,7 +17,12 @@ impl Ipv4PacketLoss {
         plug_a: Ipv4Plug,
         plug_b: Ipv4Plug,
     ) {
-        PacketLoss::spawn(handle, loss_rate, mean_loss_duration, plug_a.into(), plug_b.into())
+        PacketLoss::spawn(
+            handle,
+            loss_rate,
+            mean_loss_duration,
+            plug_a.into(),
+            plug_b.into(),
+        )
     }
 }
-

@@ -1,6 +1,8 @@
-use crate::priv_prelude::*;
 use super::*;
-use rand;
+use crate::util::ipv4_addr::{Ipv4AddrClass, Ipv4AddrExt};
+use async_std::net::Ipv4Addr;
+use std::fmt;
+use std::str::FromStr;
 
 /// A range of IPv4 addresses with a common prefix
 #[derive(Clone, Copy)]
@@ -70,17 +72,11 @@ impl Ipv4Range {
     /// Returns a random local network subnet from one of the ranges 10.0.0.0, 172.16.0.0 or
     /// 192.168.0.0
     pub fn random_local_subnet() -> Ipv4Range {
-        #[derive(Rand)]
-        enum Subnet {
-            S10,
-            S172(u8),
-            S192(u8),
-        };
-
-        match rand::random() {
-            Subnet::S10 => Ipv4Range::local_subnet_10(),
-            Subnet::S172(x) => Ipv4Range::local_subnet_172(x & 0x0f),
-            Subnet::S192(x) => Ipv4Range::local_subnet_192(x),
+        match rand::random::<u8>() % 3 {
+            0 => Ipv4Range::local_subnet_10(),
+            1 => Ipv4Range::local_subnet_172(rand::random::<u8>() & 0x0f),
+            2 => Ipv4Range::local_subnet_192(rand::random()),
+            _ => unreachable!(),
         }
     }
 
@@ -119,14 +115,14 @@ impl Ipv4Range {
         loop {
             let x = rand::random::<u32>() & mask;
             if x < 2 {
-                continue
+                continue;
             }
             let addr = Ipv4Addr::from(u32::from(self.addr) | x);
             if class != addr.class() {
-                continue
+                continue;
             }
             return addr;
-        };
+        }
     }
 
     /// Check whether this range contains the given IP address
@@ -163,10 +159,7 @@ impl Ipv4Range {
                 n += 1;
                 continue;
             }
-            ret.push(Ipv4Range {
-                addr: ip,
-                bits: 0,
-            });
+            ret.push(Ipv4Range { addr: ip, bits: 0 });
             if ret.len() == num as usize {
                 break;
             }

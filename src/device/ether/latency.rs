@@ -1,4 +1,7 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::Latency;
+use crate::wire::EtherPlug;
+use std::time::Duration;
 
 /// Adds latency to an ethernet connection
 pub struct EtherLatency {
@@ -19,7 +22,6 @@ impl EtherLatency {
         plug_a: EtherPlug,
         plug_b: EtherPlug,
     ) {
-
         Latency::spawn(
             handle,
             min_latency,
@@ -29,4 +31,3 @@ impl EtherLatency {
         )
     }
 }
-

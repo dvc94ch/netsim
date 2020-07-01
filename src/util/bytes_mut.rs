@@ -1,4 +1,4 @@
-use crate::priv_prelude::*;
+use bytes::BytesMut;
 
 pub trait BytesMutExt {
     unsafe fn uninit(len: usize) -> BytesMut;
@@ -11,4 +11,3 @@ impl BytesMutExt for BytesMut {
         ret
     }
 }
-

@@ -1,6 +1,6 @@
 // Note: this file was ripped-off from smoltcp
-
-use crate::priv_prelude::*;
+use async_std::net::{Ipv4Addr, Ipv6Addr};
+use byteorder::{ByteOrder, NetworkEndian};
 
 fn propagate_carries(word: u32) -> u16 {
     let sum = (word >> 16) + (word & 0xffff);
@@ -62,7 +62,7 @@ pub fn pseudo_header_ipv4(
     combine(&[
         data(&source_ip.octets()),
         data(&dest_ip.octets()),
-        data(&proto_len[..])
+        data(&proto_len[..]),
     ])
 }
 
@@ -79,7 +79,6 @@ pub fn pseudo_header_ipv6(
     combine(&[
         data(&source_ip.octets()),
         data(&dest_ip.octets()),
-        data(&proto_len[..])
+        data(&proto_len[..]),
     ])
 }
-

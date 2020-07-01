@@ -1,5 +1,17 @@
-use crate::priv_prelude::*;
-use futures::sync::mpsc::SendError;
+use crate::network::NetworkHandle;
+use crate::plug::Plug;
+use crate::util::bytes_mut::BytesMutExt;
+use crate::wire::{TcpFields, TcpPacket, UdpFields, UdpPacket};
+use async_std::net::Ipv6Addr;
+use byteorder::{ByteOrder, NetworkEndian};
+use bytes::{Bytes, BytesMut};
+use futures::channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
+use futures::sink::{Sink, SinkExt};
+use futures::stream::{Stream, StreamExt};
+use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 /// An IPv6 packet
 #[derive(Clone, PartialEq)]
@@ -11,29 +23,37 @@ impl fmt::Debug for Ipv6Packet {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let payload = self.payload();
 
-        f
-        .debug_struct("Ipv6Packet")
-        .field("source_ip", &self.source_ip())
-        .field("dest_ip", &self.dest_ip())
-        .field("hop_limit", &self.hop_limit())
-        .field("payload", match payload {
-            Ipv6Payload::Udp(ref udp) => {
-                if udp.verify_checksum_v6(self.source_ip(), self.dest_ip()) {
-                    udp
-                } else {
-                    &"INVALID UDP packet"
-                }
-            },
-            Ipv6Payload::Tcp(ref tcp) => {
-                if tcp.verify_checksum_v6(self.source_ip(), self.dest_ip()) {
-                    tcp
-                } else {
-                    &"INVALID TCP packet"
-                }
-            },
-            Ipv6Payload::Unknown { .. } => &payload,
-        })
-        .finish()
+        f.debug_struct("Ipv6Packet")
+            .field("source_ip", &self.source_ip())
+            .field("dest_ip", &self.dest_ip())
+            .field("hop_limit", &self.hop_limit())
+            .field(
+                "payload",
+                match payload {
+                    Ipv6Payload::Udp(ref udp) => {
+                        if udp.verify_checksum_v6(self.source_ip(), self.dest_ip()) {
+                            udp
+                        } else {
+                            &"INVALID UDP packet"
+                        }
+                    }
+                    Ipv6Payload::Tcp(ref tcp) => {
+                        if tcp.verify_checksum_v6(self.source_ip(), self.dest_ip()) {
+                            tcp
+                        } else {
+                            &"INVALID TCP packet"
+                        }
+                    }
+                    Ipv6Payload::Unknown { .. } => &payload,
+                },
+            )
+            .finish()
+    }
+}
+
+impl AsRef<[u8]> for Ipv6Packet {
+    fn as_ref(&self) -> &[u8] {
+        self.buffer.as_ref()
     }
 }
 
@@ -61,7 +81,7 @@ pub enum Ipv6Payload {
         protocol: u8,
         /// The payload data
         payload: Bytes,
-    }
+    },
 }
 
 /// The payload of an IPv6 packet. Can be used to construct an IPv6 packet and its contents
@@ -89,9 +109,10 @@ impl Ipv6PayloadFields {
     pub fn total_packet_len(&self) -> usize {
         40 + match *self {
             Ipv6PayloadFields::Udp { ref payload, .. } => 8 + payload.len(),
-            Ipv6PayloadFields::Tcp { ref payload, ref fields } => {
-                fields.header_len() + payload.len()
-            },
+            Ipv6PayloadFields::Tcp {
+                ref payload,
+                ref fields,
+            } => fields.header_len() + payload.len(),
         }
     }
 }
@@ -112,15 +133,13 @@ impl Ipv6Packet {
     /// Create a new `Ipv6Packet` with the given header fields and payload. If you are also
     /// creating the packet's payload data it can be more efficient to use
     /// `new_from_fields_recursive` and save an allocation/copy.
-    pub fn new_from_fields(
-        fields: &Ipv6Fields,
-        payload: &Ipv6Payload,
-    ) -> Ipv6Packet {
-        let len = 40 + match *payload {
-            Ipv6Payload::Udp(ref udp) => udp.as_bytes().len(),
-            Ipv6Payload::Tcp(ref tcp) => tcp.as_bytes().len(),
-            Ipv6Payload::Unknown { ref payload, .. } => payload.len(),
-        };
+    pub fn new_from_fields(fields: &Ipv6Fields, payload: &Ipv6Payload) -> Ipv6Packet {
+        let len = 40
+            + match *payload {
+                Ipv6Payload::Udp(ref udp) => udp.as_bytes().len(),
+                Ipv6Payload::Tcp(ref tcp) => tcp.as_bytes().len(),
+                Ipv6Payload::Unknown { ref payload, .. } => payload.len(),
+            };
         let mut buffer = unsafe { BytesMut::uninit(len) };
         buffer[6] = match *payload {
             Ipv6Payload::Udp(..) => 17,
@@ -168,7 +187,10 @@ impl Ipv6Packet {
         set_fields(buffer, fields);
 
         match payload_fields {
-            Ipv6PayloadFields::Udp { fields: udp_fields, ref payload } => {
+            Ipv6PayloadFields::Udp {
+                fields: udp_fields,
+                ref payload,
+            } => {
                 UdpPacket::write_to_buffer_v6(
                     &mut buffer[40..],
                     udp_fields,
@@ -176,8 +198,11 @@ impl Ipv6Packet {
                     fields.dest_ip,
                     payload,
                 );
-            },
-            Ipv6PayloadFields::Tcp { fields: tcp_fields, ref payload } => {
+            }
+            Ipv6PayloadFields::Tcp {
+                fields: tcp_fields,
+                ref payload,
+            } => {
                 TcpPacket::write_to_buffer_v6(
                     &mut buffer[40..],
                     tcp_fields,
@@ -185,25 +210,27 @@ impl Ipv6Packet {
                     fields.dest_ip,
                     payload,
                 );
-            },
+            }
         }
     }
 
     /// Parse an IPv6 packet from a byte buffer
     pub fn from_bytes(buffer: Bytes) -> Ipv6Packet {
-        Ipv6Packet {
-            buffer,
-        }
+        Ipv6Packet { buffer }
     }
 
     /// Get the source IP of the packet.
     pub fn source_ip(&self) -> Ipv6Addr {
-        Ipv6Addr::from(slice_assert_len!(16, &self.buffer[8..24]))
+        let mut addr = [0u8; 16];
+        addr.copy_from_slice(&self.buffer[8..24]);
+        Ipv6Addr::from(addr)
     }
 
     /// Get the destination IP of the packet.
     pub fn dest_ip(&self) -> Ipv6Addr {
-        Ipv6Addr::from(slice_assert_len!(16, &self.buffer[24..40]))
+        let mut addr = [0u8; 16];
+        addr.copy_from_slice(&self.buffer[24..40]);
+        Ipv6Addr::from(addr)
     }
 
     /// Get the hop limit of the packet
@@ -213,12 +240,13 @@ impl Ipv6Packet {
 
     /// Get the packet's payload
     pub fn payload(&self) -> Ipv6Payload {
+        let payload = Bytes::copy_from_slice(&self.buffer[40..]);
         match self.buffer[6] {
-            17 => Ipv6Payload::Udp(UdpPacket::from_bytes(self.buffer.slice_from(40))),
-            6 => Ipv6Payload::Tcp(TcpPacket::from_bytes(self.buffer.slice_from(40))),
+            17 => Ipv6Payload::Udp(UdpPacket::from_bytes(payload)),
+            6 => Ipv6Payload::Tcp(TcpPacket::from_bytes(payload)),
             p => Ipv6Payload::Unknown {
                 protocol: p,
-                payload: self.buffer.slice_from(40),
+                payload,
             },
         }
     }
@@ -267,13 +295,15 @@ impl Ipv6Plug {
 
     /// Add latency to a connection
     pub fn with_latency(
-        self, 
+        self,
         handle: &NetworkHandle,
         min_latency: Duration,
         mean_additional_latency: Duration,
     ) -> Ipv6Plug {
         Ipv6Plug {
-            inner: self.inner.with_latency(handle, min_latency, mean_additional_latency),
+            inner: self
+                .inner
+                .with_latency(handle, min_latency, mean_additional_latency),
         }
     }
 
@@ -285,7 +315,9 @@ impl Ipv6Plug {
         mean_loss_duration: Duration,
     ) -> Ipv6Plug {
         Ipv6Plug {
-            inner: self.inner.with_packet_loss(handle, loss_rate, mean_loss_duration),
+            inner: self
+                .inner
+                .with_packet_loss(handle, loss_rate, mean_loss_duration),
         }
     }
 
@@ -298,12 +330,12 @@ impl Ipv6Plug {
     }
 
     /// Poll for incoming packets
-    pub fn poll_incoming(&mut self) -> Async<Option<Ipv6Packet>> {
-        self.inner.rx.poll().void_unwrap()
+    pub fn poll_incoming(&mut self, cx: &mut Context) -> Poll<Option<Ipv6Packet>> {
+        Pin::new(&mut self.inner.rx).poll_next(cx)
     }
 
     /// Send a packet
-    pub fn unbounded_send(&mut self, packet: Ipv6Packet) -> Result<(), SendError<Ipv6Packet>> {
+    pub fn unbounded_send(&mut self, packet: Ipv6Packet) -> Result<(), TrySendError<Ipv6Packet>> {
         self.inner.tx.unbounded_send(packet)
     }
 }
@@ -322,16 +354,24 @@ pub trait IntoIpv6Plug {
 
 impl<S> IntoIpv6Plug for S
 where
-    S: Stream<Item = Ipv6Packet, Error = Void>,
-    S: Sink<SinkItem = Ipv6Packet, SinkError = Void>,
+    S: Stream<Item = Ipv6Packet>,
+    S: Sink<Ipv6Packet>,
     S: Send + 'static,
 {
     fn into_ipv6_plug(self, handle: &NetworkHandle) -> Ipv6Plug {
-        let (self_tx, self_rx) = self.split();
+        let (mut self_tx, mut self_rx) = self.split();
         let (plug_a, plug_b) = Ipv6Plug::new_pair();
-        let (plug_tx, plug_rx) = plug_a.split();
-        handle.spawn(self_rx.forward(plug_tx).map(|(_rx, _tx)| ()));
-        handle.spawn(plug_rx.forward(self_tx).map(|(_rx, _tx)| ()));
+        let (mut plug_tx, mut plug_rx) = plug_a.split();
+        handle.spawn(Box::pin(async move {
+            while let Some(p) = self_rx.next().await {
+                unwrap!(plug_tx.send(p).await.ok());
+            }
+        }));
+        handle.spawn(Box::pin(async move {
+            while let Some(p) = plug_rx.next().await {
+                unwrap!(self_tx.send(p).await.ok());
+            }
+        }));
         plug_b
     }
 }
@@ -348,16 +388,23 @@ impl Ipv6Sender {
     }
 }
 
-impl Sink for Ipv6Sender {
-    type SinkItem = Ipv6Packet;
-    type SinkError = Void;
+impl Sink<Ipv6Packet> for Ipv6Sender {
+    type Error = SendError;
 
-    fn start_send(&mut self, packet: Ipv6Packet) -> Result<AsyncSink<Ipv6Packet>, Void> {
-        Ok(self.tx.start_send(packet).unwrap_or(AsyncSink::Ready))
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.tx).poll_ready(cx)
     }
 
-    fn poll_complete(&mut self) -> Result<Async<()>, Void> {
-        Ok(self.tx.poll_complete().unwrap_or(Async::Ready(())))
+    fn start_send(mut self: Pin<&mut Self>, item: Ipv6Packet) -> Result<(), Self::Error> {
+        Pin::new(&mut self.tx).start_send(item)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.tx).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.tx).poll_close(cx)
     }
 }
 
@@ -368,10 +415,8 @@ pub struct Ipv6Receiver {
 
 impl Stream for Ipv6Receiver {
     type Item = Ipv6Packet;
-    type Error = Void;
 
-    fn poll(&mut self) -> Result<Async<Option<Ipv6Packet>>, Void> {
-        self.rx.poll()
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.rx).poll_next(cx)
     }
 }
-

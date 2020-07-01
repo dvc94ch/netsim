@@ -1,4 +1,8 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::node::{EtherNode, IpNode, Ipv4Node, Ipv6Node};
+use crate::range::{Ipv4Range, Ipv6Range};
+use crate::spawn_complete::SpawnComplete;
+use crate::wire::{EtherPlug, IpPlug, Ipv4Plug, Ipv6Plug};
 
 /// Spawn a hierarchical network of nodes. The returned plug can be used to write frames to the
 /// network and read frames that try to leave the network.
@@ -41,4 +45,3 @@ pub fn ipv6_tree<N: Ipv6Node>(
 ) -> (SpawnComplete<N::Output>, Ipv6Plug) {
     node.build(handle, ipv6_range)
 }
-

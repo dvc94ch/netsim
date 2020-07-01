@@ -1,25 +1,32 @@
-use crate::priv_prelude::*;
+use crate::network::NetworkHandle;
+use crate::plug::Plug;
 use crate::util;
+use async_timer::timer::PosixTimer as Timer;
+use futures::future::Future;
+use futures::stream::{FuturesUnordered, Stream};
+use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-struct InTransit<T> {
+struct InTransit<T: Unpin> {
     packet: Option<T>,
-    timeout: Delay,
+    timeout: Timer,
 }
 
-impl<T> Future for InTransit<T> {
-    type Item = T;
-    type Error = Void;
+impl<T: Unpin> Future for InTransit<T> {
+    type Output = T;
 
-    fn poll(&mut self) -> Result<Async<T>, Void> {
-        match self.timeout.poll().void_unwrap() {
-            Async::Ready(()) => Ok(Async::Ready(unwrap!(self.packet.take()))),
-            Async::NotReady => Ok(Async::NotReady),
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        match Pin::new(&mut self.timeout).poll(cx) {
+            Poll::Ready(()) => Poll::Ready(unwrap!(self.packet.take())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 /// Links two `Ipv4Plug`s and adds delay to packets travelling between them.
-pub struct Latency<T: fmt::Debug + 'static> {
+pub struct Latency<T: Unpin + fmt::Debug + 'static> {
     plug_a: Plug<T>,
     plug_b: Plug<T>,
     outgoing_a: FuturesUnordered<InTransit<T>>,
@@ -28,7 +35,7 @@ pub struct Latency<T: fmt::Debug + 'static> {
     mean_additional_latency: Duration,
 }
 
-impl<T: fmt::Debug + Send + 'static> Latency<T> {
+impl<T: Unpin + fmt::Debug + Send + 'static> Latency<T> {
     pub fn spawn(
         handle: &NetworkHandle,
         min_latency: Duration,
@@ -36,7 +43,7 @@ impl<T: fmt::Debug + Send + 'static> Latency<T> {
         plug_a: Plug<T>,
         plug_b: Plug<T>,
     ) {
-        let latency = Latency {
+        let latency = Self {
             plug_a,
             plug_b,
             outgoing_a: FuturesUnordered::new(),
@@ -48,71 +55,71 @@ impl<T: fmt::Debug + Send + 'static> Latency<T> {
     }
 }
 
-impl<T: fmt::Debug + 'static> Future for Latency<T> {
-    type Item = ();
-    type Error = Void;
+impl<T: Unpin + fmt::Debug + 'static> Future for Latency<T> {
+    type Output = ();
 
-    fn poll(&mut self) -> Result<Async<()>, Void> {
-        let now = Instant::now();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let a_unplugged = loop {
-            match self.plug_a.rx.poll().void_unwrap() {
-                Async::NotReady => break false,
-                Async::Ready(None) => break true,
-                Async::Ready(Some(packet)) => {
-                    let delay
-                        = self.min_latency
-                        + self.mean_additional_latency.mul_f64(util::expovariate_rand());
+            match Pin::new(&mut self.plug_a.rx).poll_next(cx) {
+                Poll::Pending => break false,
+                Poll::Ready(None) => break true,
+                Poll::Ready(Some(packet)) => {
+                    let delay = self.min_latency
+                        + self
+                            .mean_additional_latency
+                            .mul_f64(util::expovariate_rand());
                     let in_transit = InTransit {
                         packet: Some(packet),
-                        timeout: Delay::new(now + delay),
+                        timeout: Timer::new(delay),
                     };
                     self.outgoing_b.push(in_transit);
-                },
+                }
             }
         };
 
         let b_unplugged = loop {
-            match self.plug_b.rx.poll().void_unwrap() {
-                Async::NotReady => break false,
-                Async::Ready(None) => break true,
-                Async::Ready(Some(packet)) => {
-                    let delay
-                        = self.min_latency
-                        + self.mean_additional_latency.mul_f64(util::expovariate_rand());
+            match Pin::new(&mut self.plug_b.rx).poll_next(cx) {
+                Poll::Pending => break false,
+                Poll::Ready(None) => break true,
+                Poll::Ready(Some(packet)) => {
+                    let delay = self.min_latency
+                        + self
+                            .mean_additional_latency
+                            .mul_f64(util::expovariate_rand());
                     let in_transit = InTransit {
                         packet: Some(packet),
-                        timeout: Delay::new(now + delay),
+                        timeout: Timer::new(delay),
                     };
                     self.outgoing_a.push(in_transit);
-                },
+                }
             }
         };
 
         loop {
-            match self.outgoing_a.poll().void_unwrap() {
-                Async::NotReady => break,
-                Async::Ready(None) => break,
-                Async::Ready(Some(packet)) => {
+            match Pin::new(&mut self.outgoing_a).poll_next(cx) {
+                Poll::Pending => break,
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(packet)) => {
                     let _ = self.plug_a.tx.unbounded_send(packet);
-                },
+                }
             }
         }
 
         loop {
-            match self.outgoing_b.poll().void_unwrap() {
-                Async::NotReady => break,
-                Async::Ready(None) => break,
-                Async::Ready(Some(packet)) => {
+            match Pin::new(&mut self.outgoing_b).poll_next(cx) {
+                Poll::Pending => break,
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(packet)) => {
                     let _ = self.plug_b.tx.unbounded_send(packet);
-                },
+                }
             }
         }
 
         if a_unplugged && b_unplugged {
-            return Ok(Async::Ready(()));
+            return Poll::Ready(());
         }
 
-        Ok(Async::NotReady)
+        Poll::Pending
     }
 }
 
@@ -212,4 +219,3 @@ fn test() {
     })
 }
 */
-
