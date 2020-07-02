@@ -1,95 +1,68 @@
-extern crate env_logger;
-extern crate futures;
-extern crate netsim;
-extern crate tokio;
-#[macro_use]
-extern crate unwrap;
-#[macro_use]
-extern crate net_literals;
-
-use futures::sync::oneshot;
-use futures::{future, Future};
+use async_std::net::{SocketAddr, SocketAddrV4, UdpSocket};
+use async_std::task;
+use futures::channel::oneshot;
 use netsim::device::ipv4::Ipv4NatBuilder;
 use netsim::{node, spawn, Ipv4Range, Network};
-use tokio::net::UdpSocket;
-use tokio::runtime::Runtime;
-
-use std::net::{SocketAddr, SocketAddrV4};
 use std::str;
 
 fn main() {
     let network = Network::new();
     let handle = network.handle();
 
-    let mut runtime = unwrap!(Runtime::new());
-    let res = runtime.block_on(future::lazy(move || {
-        let (server_addr_tx, server_addr_rx) = oneshot::channel();
-        let (client0_addr_tx, client0_addr_rx) = oneshot::channel();
-        let server_node = node::ipv4::machine(|ip| {
-            println!("[server] ip = {}", ip);
+    let (server_addr_tx, server_addr_rx) = oneshot::channel();
+    let (client0_addr_tx, client0_addr_rx) = oneshot::channel();
+    let server_node = node::ipv4::machine(|ip| {
+        println!("[server] ip = {}", ip);
 
+        async move {
             let bind_addr = SocketAddr::V4(SocketAddrV4::new(ip, 0));
-            let socket = unwrap!(UdpSocket::bind(&bind_addr));
-            unwrap!(server_addr_tx.send(unwrap!(socket.local_addr())));
+            let socket = UdpSocket::bind(&bind_addr).await.unwrap();
+            server_addr_tx.send(socket.local_addr().unwrap()).unwrap();
 
+            let mut buf = [0u8; 1024];
+            let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+            let s = str::from_utf8(&buf[..len]).unwrap();
+            println!("[server] received: {}, from: {}", s, addr);
+            client0_addr_tx.send(addr).unwrap();
+        }
+    });
+
+    let client0_node = node::ipv4::machine(|ip| {
+        println!("[client0] ip = {}", ip);
+
+        async move {
+            let server_addr = server_addr_rx.await.unwrap();
+            println!("[client0] Got server addr: {}", server_addr);
+
+            let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            socket.send_to(b"hello world", &server_addr).await.unwrap();
+            let mut buf = [0u8; 1024];
+            let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+            let s = str::from_utf8(&buf[..len]).unwrap();
+            println!("[client0] received: {}, from: {}", s, addr);
+        }
+    });
+
+    let nat_builder = Ipv4NatBuilder::new().subnet(Ipv4Range::local_subnet_192(0));
+    let client0_behind_nat_node = node::ipv4::nat(nat_builder, client0_node);
+
+    let client1_node = node::ipv4::machine(|ip| {
+        println!("[client1] ip = {}", ip);
+
+        async move {
+            let client0_addr = client0_addr_rx.await.unwrap();
+            println!("[client1] Got client0 addr: {}", client0_addr);
+
+            let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
             socket
-                .recv_dgram(vec![0u8; 1024])
-                .map_err(|e| panic!("error sending: {}", e))
-                .map(|(_socket, buf, len, addr)| {
-                    let s = unwrap!(str::from_utf8(&buf[..len]));
-                    println!("[server] received: {}, from: {}", s, addr);
-                    unwrap!(client0_addr_tx.send(addr));
-                })
-        });
+                .send_to(b"this is client1!", &client0_addr)
+                .await
+                .unwrap();
+        }
+    });
 
-        let client0_node = node::ipv4::machine(|ip| {
-            println!("[client0] ip = {}", ip);
+    let router_node = node::ipv4::router((server_node, client0_behind_nat_node, client1_node));
+    let (spawn_complete, _ipv4_plug) = spawn::ipv4_tree(&handle, Ipv4Range::global(), router_node);
 
-            server_addr_rx
-                .map_err(|e| panic!("error receiving server addr: {}", e))
-                .and_then(|server_addr| {
-                    println!("[client0] Got server addr: {}", server_addr);
-
-                    let socket = unwrap!(UdpSocket::bind(&addr!("0.0.0.0:0")));
-                    socket
-                        .send_dgram(b"hello world", &server_addr)
-                        .map_err(|e| panic!("error sending: {}", e))
-                        .and_then(|(socket, _buf)| {
-                            socket
-                                .recv_dgram(vec![0; 1024])
-                                .map_err(|e| panic!("error receiving: {}", e))
-                                .map(|(_socket, buf, len, addr)| {
-                                    let s = unwrap!(str::from_utf8(&buf[..len]));
-                                    println!("[client0] received: {}, from: {}", s, addr);
-                                })
-                        })
-                })
-        });
-
-        let nat_builder = Ipv4NatBuilder::new().subnet(Ipv4Range::local_subnet_192(0));
-        let client0_behind_nat_node = node::ipv4::nat(nat_builder, client0_node);
-
-        let client1_node = node::ipv4::machine(|ip| {
-            println!("[client1] ip = {}", ip);
-
-            client0_addr_rx
-                .map_err(|e| panic!("failed to receive client0 addr: {}", e))
-                .and_then(|client0_addr| {
-                    println!("[client1] Got client0 addr: {}", client0_addr);
-
-                    let socket = unwrap!(UdpSocket::bind(&addr!("0.0.0.0:0")));
-                    socket
-                        .send_dgram(b"this is client1!", &client0_addr)
-                        .map_err(|e| panic!("error sending: {}", e))
-                        .map(|(_socket, _buf)| ())
-                })
-        });
-
-        let router_node = node::ipv4::router((server_node, client0_behind_nat_node, client1_node));
-        let (spawn_complete, _ipv4_plug) =
-            spawn::ipv4_tree(&handle, Ipv4Range::global(), router_node);
-
-        spawn_complete.map(|((), (), ())| ())
-    }));
-    unwrap!(res)
+    task::block_on(spawn_complete).unwrap();
 }
