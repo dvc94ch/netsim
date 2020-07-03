@@ -65,23 +65,24 @@ impl Future for TunTask {
 
         loop {
             trace!("TunTask: looping receiver ...");
-            if self.sending_packet.is_some() {
+
+            match Pin::new(&mut self.tun).poll_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Pending => {
+                    trace!("TunTask: TUN sink not ready");
+                    break
+                }
+                Poll::Ready(Err(e)) => {
+                    panic!("writing TAP device yielded an error: {}", e);
+                }
+            };
+
+            if let Some(frame) = self.sending_packet.take() {
                 trace!("TunTask: we have a frame ready to send");
-                match Pin::new(&mut self.tun).poll_ready(cx) {
-                    Poll::Ready(Ok(())) => {
-                        if let Some(frame) = self.sending_packet.take() {
-                            if let Err(e) = Pin::new(&mut self.tun).start_send(frame) {
-                                panic!("completing TAP device write yielded an error: {}", e);
-                            }
-                        }
-                    }
-                    Poll::Pending => {
-                        trace!("TunTask: couldn't send the frame ;(");
-                        break;
-                    }
-                    Poll::Ready(Err(e)) => {
-                        panic!("writing TAP device yielded an error: {}", e);
-                    }
+                if let Err(e) = Pin::new(&mut self.tun).start_send(frame) {
+                    panic!("completing TAP device write yielded an error: {}", e);
+                } else {
+                    continue
                 }
             }
 
@@ -90,9 +91,12 @@ impl Future for TunTask {
                     Poll::Ready(Some(frame)) => {
                         trace!("TunTask: we received a frame");
                         self.sending_packet = Some(frame);
-                        continue;
                     }
-                    _ => break,
+                    Poll::Pending => {
+                        trace!("TunTask: no frames");
+                        break
+                    }
+                    Poll::Ready(None) => unreachable!(),
                 }
             }
         }

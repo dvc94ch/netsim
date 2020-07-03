@@ -63,21 +63,21 @@ impl Future for TapTask {
         }
 
         loop {
-            if self.sending_frame.is_some() {
-                match Pin::new(&mut self.tap).poll_ready(cx) {
-                    Poll::Ready(Ok(())) => {
-                        if let Some(frame) = self.sending_frame.take() {
-                            if let Err(e) = Pin::new(&mut self.tap).start_send(frame) {
-                                panic!("writing TAP device yielded an error: {}", e);
-                            }
-                        }
-                    }
-                    Poll::Pending => {
-                        break;
-                    }
-                    Poll::Ready(Err(e)) => {
-                        panic!("completing TAP device write yielded an error: {}", e);
-                    }
+            match Pin::new(&mut self.tap).poll_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Pending => {
+                    break;
+                }
+                Poll::Ready(Err(e)) => {
+                    panic!("completing TAP device write yielded an error: {}", e);
+                }
+            };
+
+            if let Some(frame) = self.sending_frame.take() {
+                if let Err(e) = Pin::new(&mut self.tap).start_send(frame) {
+                    panic!("writing TAP device yielded an error: {}", e);
+                } else {
+                    continue
                 }
             }
 
@@ -85,9 +85,9 @@ impl Future for TapTask {
                 match Pin::new(&mut self.frame_rx).poll_next(cx) {
                     Poll::Ready(Some(frame)) => {
                         self.sending_frame = Some(frame);
-                        continue;
                     }
-                    _ => break,
+                    Poll::Pending => break,
+                    Poll::Ready(None) => unreachable!(),
                 }
             }
         }
