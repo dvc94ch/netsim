@@ -167,6 +167,8 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::test::run_test;
+    use async_std::task;
     use std::cell::Cell;
 
     #[test]
@@ -183,8 +185,7 @@ mod test {
                     v.set(456);
                 });
             });
-            let mut runtime = unwrap!(Runtime::new());
-            unwrap!(runtime.block_on(spawn_complete));
+            task::block_on(spawn_complete).unwrap();
             TEST.with(|v| assert_eq!(v.get(), 123));
         })
     }
@@ -196,8 +197,7 @@ mod test {
             let spawn_complete = new_namespace(|| {
                 panic!("this is supposed to panic");
             });
-            let mut runtime = unwrap!(Runtime::new());
-            unwrap!(runtime.block_on(spawn_complete));
+            task::block_on(spawn_complete).unwrap();
         })
     }
 }

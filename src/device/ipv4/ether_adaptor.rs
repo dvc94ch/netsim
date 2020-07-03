@@ -213,22 +213,25 @@ impl Future for EtherAdaptorV4 {
 
 #[test]
 fn test() {
-    run_test(1, || {
-        use rand;
-        use tokio;
-        use void;
+    use crate::test::run_test;
+    use crate::util::ipv4_addr::Ipv4AddrExt;
+    use crate::wire::{Ipv4Fields, Ipv4PayloadFields, UdpFields};
+    use async_std::task;
+    use bytes::Bytes;
+    use futures::sink::SinkExt;
+    use futures::stream::StreamExt;
 
-        let mut runtime = unwrap!(Runtime::new());
-        let res = runtime.block_on(future::lazy(|| {
+    run_test(1, || {
+        task::block_on(async {
             let (ether_plug_0, ether_plug_1) = EtherPlug::new_pair();
             let (ipv4_plug_0, ipv4_plug_1) = Ipv4Plug::new_pair();
             let veth_ip = Ipv4Addr::random_global();
             let veth = EtherAdaptorV4::new(veth_ip, ether_plug_0, ipv4_plug_0);
             let veth_mac = veth.mac_addr();
-            tokio::spawn(veth.infallible());
+            task::spawn(veth);
 
-            let (ether_tx, ether_rx) = ether_plug_1.split();
-            let (ipv4_tx, ipv4_rx) = ipv4_plug_1.split();
+            let (mut ether_tx, mut ether_rx) = ether_plug_1.split();
+            let (mut ipv4_tx, mut ipv4_rx) = ipv4_plug_1.split();
 
             let source_ip = Ipv4Addr::random_global();
             let dest_ip = Ipv4Addr::random_global();
@@ -243,7 +246,7 @@ fn test() {
                         source_port: rand::random(),
                         dest_port: rand::random(),
                     },
-                    payload: Bytes::from(&rand::random::<[u8; 8]>()[..]),
+                    payload: Bytes::from(rand::random::<[u8; 8]>().to_vec()),
                 },
             );
 
@@ -255,143 +258,121 @@ fn test() {
                 &EtherPayload::Ipv4(ipv4_packet.clone()),
             );
 
-            ether_tx
-            .send(frame_with_ipv4_packet)
-            .map_err(|_e| panic!("ether channel hung up!"))
-            .and_then(move |ether_tx| {
-                ipv4_rx
-                .into_future()
-                .map_err(|(v, _ipv4_rx)| void::unreachable(v))
-                .and_then(move |(packet_opt, _ipv4_rx)| {
-                    let packet = unwrap!(packet_opt);
-                    assert_eq!(packet, ipv4_packet);
+            ether_tx.send(frame_with_ipv4_packet).await.unwrap();
+            let packet = ipv4_rx.next().await.unwrap();
+            assert_eq!(packet, ipv4_packet);
 
-                    let requester_mac = MacAddr::random();
-                    let requester_ip = Ipv4Addr::random_global();
-                    let frame = EtherFrame::new_from_fields_recursive(
-                        EtherFields {
-                            source_mac: requester_mac,
-                            dest_mac: MacAddr::BROADCAST,
-                        },
-                        EtherPayloadFields::Arp {
-                            fields: ArpFields::Request {
-                                source_mac: requester_mac,
-                                source_ip: requester_ip,
-                                dest_ip: veth_ip,
-                            },
-                        },
+            let requester_mac = MacAddr::random();
+            let requester_ip = Ipv4Addr::random_global();
+            let frame = EtherFrame::new_from_fields_recursive(
+                EtherFields {
+                    source_mac: requester_mac,
+                    dest_mac: MacAddr::BROADCAST,
+                },
+                EtherPayloadFields::Arp {
+                    fields: ArpFields::Request {
+                        source_mac: requester_mac,
+                        source_ip: requester_ip,
+                        dest_ip: veth_ip,
+                    },
+                },
+            );
+
+            ether_tx.send(frame).await.unwrap();
+            let frame = ether_rx.next().await.unwrap();
+            assert_eq!(
+                frame.fields(),
+                EtherFields {
+                    source_mac: veth_mac,
+                    dest_mac: requester_mac,
+                }
+            );
+            match frame.payload() {
+                EtherPayload::Arp(arp) => {
+                    assert_eq!(
+                        arp.fields(),
+                        ArpFields::Response {
+                            source_mac: veth_mac,
+                            source_ip: veth_ip,
+                            dest_mac: requester_mac,
+                            dest_ip: requester_ip,
+                        }
                     );
+                }
+                payload => panic!("unexpected ether payload: {:?}", payload),
+            }
 
-                    ether_tx
-                    .send(frame)
-                    .map_err(|_e| panic!("ether channel hung up!"))
-                    .and_then(move |ether_tx| {
-                        ether_rx
-                        .into_future()
-                        .map_err(|(v, _ether_rx)| void::unreachable(v))
-                        .and_then(move |(frame_opt, ether_rx)| {
-                            let frame = unwrap!(frame_opt);
-                            assert_eq!(frame.fields(), EtherFields {
-                                source_mac: veth_mac,
-                                dest_mac: requester_mac,
-                            });
-                            match frame.payload() {
-                                EtherPayload::Arp(arp) => {
-                                    assert_eq!(arp.fields(), ArpFields::Response {
-                                        source_mac: veth_mac,
-                                        source_ip: veth_ip,
-                                        dest_mac: requester_mac,
-                                        dest_ip: requester_ip,
-                                    });
-                                },
-                                payload => panic!("unexpected ether payload: {:?}", payload),
-                            }
+            let source_ip = Ipv4Addr::random_global();
+            let dest_ip = Ipv4Addr::random_global();
+            let ipv4_packet = Ipv4Packet::new_from_fields_recursive(
+                Ipv4Fields {
+                    source_ip: source_ip,
+                    dest_ip: dest_ip,
+                    ttl: rand::random(),
+                },
+                Ipv4PayloadFields::Udp {
+                    fields: UdpFields {
+                        source_port: rand::random(),
+                        dest_port: rand::random(),
+                    },
+                    payload: Bytes::from(rand::random::<[u8; 8]>().to_vec()),
+                },
+            );
 
-                            let source_ip = Ipv4Addr::random_global();
-                            let dest_ip = Ipv4Addr::random_global();
-                            let ipv4_packet = Ipv4Packet::new_from_fields_recursive(
-                                Ipv4Fields {
-                                    source_ip: source_ip,
-                                    dest_ip: dest_ip,
-                                    ttl: rand::random(),
-                                },
-                                Ipv4PayloadFields::Udp {
-                                    fields: UdpFields {
-                                        source_port: rand::random(),
-                                        dest_port: rand::random(),
-                                    },
-                                    payload: Bytes::from(&rand::random::<[u8; 8]>()[..]),
-                                },
-                            );
+            ipv4_tx.send(ipv4_packet.clone()).await.unwrap();
+            let frame = ether_rx.next().await.unwrap();
+            assert_eq!(
+                frame.fields(),
+                EtherFields {
+                    source_mac: veth_mac,
+                    dest_mac: MacAddr::BROADCAST,
+                }
+            );
+            match frame.payload() {
+                EtherPayload::Arp(arp) => {
+                    assert_eq!(
+                        arp.fields(),
+                        ArpFields::Request {
+                            source_mac: veth_mac,
+                            source_ip: veth_ip,
+                            dest_ip: dest_ip,
+                        }
+                    );
+                }
+                payload => panic!("unexpected ether payload: {:?}", payload),
+            }
 
-                            ipv4_tx
-                            .send(ipv4_packet.clone())
-                            .map_err(|_e| panic!("ipv4 channel hung up!"))
-                            .and_then(move |_ipv4_tx| {
-                                ether_rx
-                                .into_future()
-                                .map_err(|(v, _ether_rx)| void::unreachable(v))
-                            })
-                            .and_then(move |(frame_opt, ether_rx)| {
-                                let frame = unwrap!(frame_opt);
-                                assert_eq!(frame.fields(), EtherFields {
-                                    source_mac: veth_mac,
-                                    dest_mac: MacAddr::BROADCAST,
-                                });
-                                match frame.payload() {
-                                    EtherPayload::Arp(arp) => {
-                                        assert_eq!(arp.fields(), ArpFields::Request {
-                                            source_mac: veth_mac,
-                                            source_ip: veth_ip,
-                                            dest_ip: dest_ip,
-                                        });
-                                    },
-                                    payload => panic!("unexpected ether payload: {:?}", payload),
-                                }
+            let dest_mac = MacAddr::random();
+            let frame = EtherFrame::new_from_fields_recursive(
+                EtherFields {
+                    source_mac: dest_mac,
+                    dest_mac: veth_mac,
+                },
+                EtherPayloadFields::Arp {
+                    fields: ArpFields::Response {
+                        source_mac: dest_mac,
+                        source_ip: dest_ip,
+                        dest_mac: veth_mac,
+                        dest_ip: veth_ip,
+                    },
+                },
+            );
 
-                                let dest_mac = MacAddr::random();
-                                let frame = EtherFrame::new_from_fields_recursive(
-                                    EtherFields {
-                                        source_mac: dest_mac,
-                                        dest_mac: veth_mac,
-                                    },
-                                    EtherPayloadFields::Arp {
-                                        fields: ArpFields::Response {
-                                            source_mac: dest_mac,
-                                            source_ip: dest_ip,
-                                            dest_mac: veth_mac,
-                                            dest_ip: veth_ip,
-                                        },
-                                    },
-                                );
-
-                                ether_tx
-                                .send(frame)
-                                .map_err(|_e| panic!("ether channel hung up!"))
-                                .and_then(move |_ether_tx| {
-                                    ether_rx
-                                    .into_future()
-                                    .map_err(|(v, _ether_rx)| void::unreachable(v))
-                                })
-                                .map(move |(frame_opt, _ether_rx)| {
-                                    let frame = unwrap!(frame_opt);
-                                    assert_eq!(frame.fields(), EtherFields {
-                                        source_mac: veth_mac,
-                                        dest_mac: dest_mac,
-                                    });
-                                    match frame.payload() {
-                                        EtherPayload::Ipv4(packet) => {
-                                            assert_eq!(packet, ipv4_packet);
-                                        },
-                                        payload => panic!("unexpected ether payload: {:?}", payload),
-                                    }
-                                })
-                            })
-                        })
-                    })
-                })
-            })
-        }));
-        res.void_unwrap()
+            ether_tx.send(frame).await.unwrap();
+            let frame = ether_rx.next().await.unwrap();
+            assert_eq!(
+                frame.fields(),
+                EtherFields {
+                    source_mac: veth_mac,
+                    dest_mac: dest_mac,
+                }
+            );
+            match frame.payload() {
+                EtherPayload::Ipv4(packet) => {
+                    assert_eq!(packet, ipv4_packet);
+                }
+                payload => panic!("unexpected ether payload: {:?}", payload),
+            }
+        })
     })
 }

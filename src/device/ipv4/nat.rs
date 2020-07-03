@@ -644,15 +644,19 @@ impl Future for Ipv4Nat {
 
 #[test]
 fn test() {
-    run_test(1, || {
-        use rand;
-        use void;
+    use crate::network::Network;
+    use crate::test::run_test;
+    use crate::util::ipv4_addr::Ipv4AddrExt;
+    use async_std::task;
+    use bytes::Bytes;
+    use futures::sink::SinkExt;
+    use futures::stream::StreamExt;
 
-        let mut runtime = unwrap!(Runtime::new());
+    run_test(1, || {
         let network = Network::new();
         let handle = network.handle();
 
-        let res = runtime.block_on(future::lazy(move || {
+        task::block_on(async {
             let (public_plug_0, public_plug_1) = Ipv4Plug::new_pair();
             let (private_plug_0, private_plug_1) = Ipv4Plug::new_pair();
             let public_ip = Ipv4Addr::random_global();
@@ -660,8 +664,8 @@ fn test() {
 
             Ipv4Nat::spawn(&handle, public_plug_0, private_plug_0, public_ip, subnet);
 
-            let (public_tx, public_rx) = public_plug_1.split();
-            let (private_tx, private_rx) = private_plug_1.split();
+            let (mut public_tx, mut public_rx) = public_plug_1.split();
+            let (mut private_tx, mut private_rx) = private_plug_1.split();
 
             let remote_addr =
                 SocketAddrV4::new(Ipv4Addr::random_global(), rand::random::<u16>() / 2 + 1000);
@@ -670,7 +674,7 @@ fn test() {
                 rand::random::<u16>() / 2 + 1000,
             );
             let initial_ttl = rand::random::<u8>() / 2 + 16;
-            let payload = Bytes::from(&rand::random::<[u8; 8]>()[..]);
+            let payload = Bytes::from(rand::random::<[u8; 8]>().to_vec());
             let packet = Ipv4Packet::new_from_fields_recursive(
                 Ipv4Fields {
                     source_ip: *local_addr.ip(),
@@ -686,88 +690,66 @@ fn test() {
                 },
             );
 
-            private_tx
-                .send(packet)
-                .map_err(|_e| panic!("private side hung up!"))
-                .and_then(move |_private_tx| {
-                    public_rx
-                        .into_future()
-                        .map_err(|(v, _public_rx)| void::unreachable(v))
-                        .and_then(move |(packet_opt, _public_rx)| {
-                            let packet = unwrap!(packet_opt);
-                            assert_eq!(
-                                packet.fields(),
-                                Ipv4Fields {
-                                    source_ip: public_ip,
-                                    dest_ip: *remote_addr.ip(),
-                                    ttl: initial_ttl - 1,
-                                }
-                            );
-                            let mapped_port = match packet.payload() {
-                                Ipv4Payload::Udp(udp) => {
-                                    assert_eq!(udp.payload(), payload);
-                                    assert_eq!(udp.dest_port(), remote_addr.port());
-                                    udp.source_port()
-                                }
-                                payload => panic!("unexpected ipv4 payload: {:?}", payload),
-                            };
-                            let payload = Bytes::from(&rand::random::<[u8; 8]>()[..]);
-                            let packet = Ipv4Packet::new_from_fields_recursive(
-                                Ipv4Fields {
-                                    source_ip: *remote_addr.ip(),
-                                    dest_ip: public_ip,
-                                    ttl: initial_ttl,
-                                },
-                                Ipv4PayloadFields::Udp {
-                                    fields: UdpFields {
-                                        source_port: remote_addr.port(),
-                                        dest_port: mapped_port,
-                                    },
-                                    payload: payload.clone(),
-                                },
-                            );
+            private_tx.send(packet).await.unwrap();
+            let packet = public_rx.next().await.unwrap();
+            assert_eq!(
+                packet.fields(),
+                Ipv4Fields {
+                    source_ip: public_ip,
+                    dest_ip: *remote_addr.ip(),
+                    ttl: initial_ttl - 1,
+                }
+            );
+            let mapped_port = match packet.payload() {
+                Ipv4Payload::Udp(udp) => {
+                    assert_eq!(udp.payload(), payload);
+                    assert_eq!(udp.dest_port(), remote_addr.port());
+                    udp.source_port()
+                }
+                payload => panic!("unexpected ipv4 payload: {:?}", payload),
+            };
+            let payload = Bytes::from(rand::random::<[u8; 8]>().to_vec());
+            let packet = Ipv4Packet::new_from_fields_recursive(
+                Ipv4Fields {
+                    source_ip: *remote_addr.ip(),
+                    dest_ip: public_ip,
+                    ttl: initial_ttl,
+                },
+                Ipv4PayloadFields::Udp {
+                    fields: UdpFields {
+                        source_port: remote_addr.port(),
+                        dest_port: mapped_port,
+                    },
+                    payload: payload.clone(),
+                },
+            );
 
-                            public_tx
-                                .send(packet)
-                                .map_err(|_e| panic!("public side hung up!"))
-                                .and_then(move |_public_tx| {
-                                    private_rx
-                                        .into_future()
-                                        .map_err(|(v, _private_rx)| void::unreachable(v))
-                                        .map(move |(packet_opt, _private_rx)| {
-                                            let packet = unwrap!(packet_opt);
-                                            assert_eq!(
-                                                packet.fields(),
-                                                Ipv4Fields {
-                                                    source_ip: *remote_addr.ip(),
-                                                    dest_ip: *local_addr.ip(),
-                                                    ttl: initial_ttl - 1,
-                                                }
-                                            );
-                                            match packet.payload() {
-                                                Ipv4Payload::Udp(udp) => {
-                                                    assert_eq!(udp.payload(), payload);
-                                                    assert_eq!(
-                                                        udp.source_port(),
-                                                        remote_addr.port()
-                                                    );
-                                                    assert_eq!(udp.dest_port(), local_addr.port());
-                                                }
-                                                payload => {
-                                                    panic!("unexpected ipv4 payload: {:?}", payload)
-                                                }
-                                            }
-                                        })
-                                })
-                        })
-                })
-        }));
-        res.void_unwrap()
+            public_tx.send(packet).await.unwrap();
+            let packet = private_rx.next().await.unwrap();
+            assert_eq!(
+                packet.fields(),
+                Ipv4Fields {
+                    source_ip: *remote_addr.ip(),
+                    dest_ip: *local_addr.ip(),
+                    ttl: initial_ttl - 1,
+                }
+            );
+            match packet.payload() {
+                Ipv4Payload::Udp(udp) => {
+                    assert_eq!(udp.payload(), payload);
+                    assert_eq!(udp.source_port(), remote_addr.port());
+                    assert_eq!(udp.dest_port(), local_addr.port());
+                }
+                payload => panic!("unexpected ipv4 payload: {:?}", payload),
+            }
+        })
     })
 }
 
 #[test]
 fn test_port_restriction() {
+    use crate::util::ipv4_addr::Ipv4AddrExt;
+
     let mut unrestricted = PortMap::default();
     let mut restricted = PortMap::default();
     restricted.allowed_endpoints = Some(HashMap::new());
@@ -792,6 +774,8 @@ fn test_port_restriction() {
 
 #[test]
 fn test_symmetric_map() {
+    use crate::util::ipv4_addr::Ipv4AddrExt;
+
     let mut asymmetric = PortMap::default();
     let mut symmetric = PortMap::default();
     symmetric.symmetric_map = Some(SymmetricMap::default());

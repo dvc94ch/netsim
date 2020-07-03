@@ -549,9 +549,11 @@ pub fn put_up(iface_name: &str) -> Result<(), PutUpError> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::iface::EtherIfaceBuilder;
     use crate::spawn;
-    use capabilities;
-    use rand;
+    use crate::test::run_test;
+    use crate::util::ipv6_addr::Ipv6AddrExt;
+    use async_std::task;
 
     #[test]
     fn configure_tap() {
@@ -625,8 +627,7 @@ mod test {
 
                 drop(tap);
             });
-            let mut runtime = unwrap!(Runtime::new());
-            unwrap!(runtime.block_on(spawn_complete))
+            task::block_on(spawn_complete).unwrap();
         })
     }
 }

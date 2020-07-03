@@ -145,63 +145,59 @@ impl Future for Ipv4Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::range::Ipv4Range;
+    use crate::wire::{Ipv4Fields, Ipv4Payload, UdpFields, UdpPacket};
+    use async_std::net::SocketAddrV4;
+    use async_std::task;
+    use bytes::Bytes;
+    use futures::stream::StreamExt;
 
-    mod ipv4_router {
-        use super::*;
+    fn udp_packet_v4(src: SocketAddrV4, dst: SocketAddrV4) -> Ipv4Packet {
+        Ipv4Packet::new_from_fields(
+            Ipv4Fields {
+                source_ip: src.ip().clone(),
+                dest_ip: dst.ip().clone(),
+                ttl: 10,
+            },
+            &Ipv4Payload::Udp(UdpPacket::new_from_fields_v4(
+                &UdpFields {
+                    source_port: src.port(),
+                    dest_port: dst.port(),
+                },
+                src.ip().clone(),
+                dst.ip().clone(),
+                &Bytes::new(),
+            )),
+        )
+    }
 
-        mod send_packet {
-            use super::*;
+    #[test]
+    fn it_returns_false_when_packet_sender_is_not_found_for_packet_destination_ip() {
+        let mut router = Ipv4Router::new(ipv4!("192.168.1.1"), vec![]);
+        let packet = udp_packet_v4(addrv4!("192.168.1.100:5000"), addrv4!("192.168.1.200:6000"));
 
-            fn udp_packet_v4(src: SocketAddrV4, dst: SocketAddrV4) -> Ipv4Packet {
-                Ipv4Packet::new_from_fields(
-                    Ipv4Fields {
-                        source_ip: src.ip().clone(),
-                        dest_ip: dst.ip().clone(),
-                        ttl: 10,
-                    },
-                    &Ipv4Payload::Udp(UdpPacket::new_from_fields_v4(
-                        &UdpFields {
-                            source_port: src.port(),
-                            dest_port: dst.port(),
-                        },
-                        src.ip().clone(),
-                        dst.ip().clone(),
-                        &Bytes::new(),
-                    )),
-                )
-            }
+        let sent = router.send_packet(packet);
 
-            #[test]
-            fn it_returns_false_when_packet_sender_is_not_found_for_packet_destination_ip() {
-                let mut router = Ipv4Router::new(ipv4!("192.168.1.1"), vec![]);
-                let packet =
-                    udp_packet_v4(addrv4!("192.168.1.100:5000"), addrv4!("192.168.1.200:6000"));
+        assert!(!sent);
+    }
 
-                let sent = router.send_packet(packet);
+    #[test]
+    fn it_sends_packet_to_the_channel_associated_with_packet_destination_address() {
+        let (plug1_a, mut plug1_b) = Ipv4Plug::new_pair();
+        let conns = vec![(
+            plug1_a,
+            vec![Ipv4Route::new(
+                Ipv4Range::new(ipv4!("192.168.1.0"), 24),
+                None,
+            )],
+        )];
+        let mut router = Ipv4Router::new(ipv4!("192.168.1.1"), conns);
+        let packet = udp_packet_v4(addrv4!("192.168.1.100:5000"), addrv4!("192.168.1.200:6000"));
 
-                assert!(!sent);
-            }
+        let sent = router.send_packet(packet.clone());
 
-            #[test]
-            fn it_sends_packet_to_the_channel_associated_with_packet_destination_address() {
-                let (plug1_a, mut plug1_b) = Ipv4Plug::new_pair();
-                let conns = vec![(
-                    plug1_a,
-                    vec![Ipv4Route::new(
-                        Ipv4Range::new(ipv4!("192.168.1.0"), 24),
-                        None,
-                    )],
-                )];
-                let mut router = Ipv4Router::new(ipv4!("192.168.1.1"), conns);
-                let packet =
-                    udp_packet_v4(addrv4!("192.168.1.100:5000"), addrv4!("192.168.1.200:6000"));
-
-                let sent = router.send_packet(packet.clone());
-
-                assert!(sent);
-                let received_packet = plug1_b.poll();
-                assert_eq!(received_packet, Ok(Async::Ready(Some(packet))));
-            }
-        }
+        assert!(sent);
+        let received_packet = task::block_on(plug1_b.next());
+        assert_eq!(received_packet, Some(packet));
     }
 }

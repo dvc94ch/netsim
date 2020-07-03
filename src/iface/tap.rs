@@ -174,12 +174,14 @@ impl Sink<EtherFrame> for EtherIface {
 #[cfg(feature = "linux_host")]
 #[cfg(test)]
 mod test {
-    use crate::iface;
-    use crate::priv_prelude::*;
-    use crate::spawn;
-    use capabilities;
-    use get_if_addrs::{self, IfAddr};
-    use rand;
+    use super::*;
+    use crate::range::Ipv4Range;
+    use crate::test::run_test;
+    use crate::util::ipv4_addr::Ipv4AddrExt;
+    use crate::util::ipv6_addr::Ipv6AddrExt;
+    use crate::{iface, spawn};
+    use async_std::task;
+    use get_if_addrs::IfAddr;
 
     #[test]
     fn build_tap_correct_settings() {
@@ -238,8 +240,7 @@ mod test {
 
                 drop(tap);
             });
-            let mut runtime = unwrap!(Runtime::new());
-            unwrap!(runtime.block_on(spawn_complete))
+            task::block_on(spawn_complete).unwrap();
         })
     }
 
@@ -283,8 +284,7 @@ mod test {
                 }
                 trace!("build_tap_duplicate_name: done");
             });
-            let mut runtime = unwrap!(Runtime::new());
-            unwrap!(runtime.block_on(spawn_complete))
+            task::block_on(spawn_complete).unwrap();
         });
     }
 
@@ -300,8 +300,7 @@ mod test {
                     res => panic!("unexpected result: {:?}", res),
                 }
             });
-            let mut runtime = unwrap!(Runtime::new());
-            unwrap!(runtime.block_on(spawn_complete))
+            task::block_on(spawn_complete).unwrap();
         })
     }
 }
