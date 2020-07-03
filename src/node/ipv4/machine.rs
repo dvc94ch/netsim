@@ -107,6 +107,7 @@ mod test {
                         trace!("waiting to receive reply");
                         let mut buffer_in = [0u8; 8];
                         let (len, addr) = socket.recv_from(&mut buffer_in).await.unwrap();
+                        trace!("received reply");
                         assert_eq!(len, 8);
                         assert_eq!(addr, SocketAddr::V4(remote_addr));
                         assert_eq!(buffer_out, buffer_in);
@@ -417,8 +418,12 @@ mod test {
                     },
                 );
 
+                trace!("start sending packet");
                 tx.send(ping).await.unwrap();
+                trace!("done sending packet");
+                trace!("start receiving packet");
                 let packet = rx.next().await.unwrap();
+                trace!("done receiving packet");
                 let icmp = match packet.payload() {
                     Ipv4Payload::Icmp(icmp) => icmp,
                     payload => panic!("unexpected ipv4 payload kind in reply: {:?}", payload),
@@ -436,7 +441,6 @@ mod test {
                     kind => panic!("unexpected ICMP reply kind: {:?}", kind),
                 }
                 done_tx.send(()).unwrap();
-
                 spawn_complete.await.unwrap().unwrap();
             })
         })

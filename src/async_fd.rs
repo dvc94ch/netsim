@@ -43,6 +43,7 @@ impl Drop for Fd {
 
 impl Read for Fd {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        trace!("reading fd {}", self.as_raw_fd());
         let res = unsafe { libc::read(self.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if res < 0 {
             return Err(io::Error::last_os_error());
@@ -53,6 +54,7 @@ impl Read for Fd {
 
 impl Write for Fd {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        trace!("writing fd {}", self.as_raw_fd());
         let res = unsafe { libc::write(self.as_raw_fd(), buf.as_ptr() as *mut _, buf.len()) };
         if res < 0 {
             return Err(io::Error::last_os_error());

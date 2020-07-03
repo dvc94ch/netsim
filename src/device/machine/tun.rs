@@ -48,8 +48,11 @@ impl Future for TunTask {
 
         let mut received_frames = false;
         loop {
+            trace!("TunTask: looping receiver");
+
             match Pin::new(&mut self.tun).poll_next(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
+                    trace!("TunTask: received packet");
                     self.packet_tx.unbounded_send(frame);
                     received_frames = true;
                 }
@@ -62,45 +65,48 @@ impl Future for TunTask {
                 }
             }
         }
+        trace!("TunTask: done looping receiver");
 
         loop {
-            trace!("TunTask: looping receiver ...");
+            trace!("TunTask: looping sender ...");
 
-            match Pin::new(&mut self.tun).poll_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Pending => {
-                    trace!("TunTask: TUN sink not ready");
-                    break
-                }
-                Poll::Ready(Err(e)) => {
-                    panic!("writing TAP device yielded an error: {}", e);
-                }
-            };
+            loop {
+                match Pin::new(&mut self.tun).poll_ready(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Pending => {
+                        trace!("TunTask: TUN sink not ready");
+                        break;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        panic!("writing TAP device yielded an error: {}", e);
+                    }
+                };
 
-            if let Some(frame) = self.sending_packet.take() {
-                trace!("TunTask: we have a frame ready to send");
-                if let Err(e) = Pin::new(&mut self.tun).start_send(frame) {
-                    panic!("completing TAP device write yielded an error: {}", e);
+                if let Some(frame) = self.sending_packet.take() {
+                    trace!("TunTask: sending packet");
+                    if let Err(e) = Pin::new(&mut self.tun).start_send(frame) {
+                        panic!("completing TAP device write yielded an error: {}", e);
+                    }
                 } else {
-                    continue
+                    break;
                 }
             }
 
             if self.sending_packet.is_none() {
                 match Pin::new(&mut self.packet_rx).poll_next(cx) {
-                    Poll::Ready(Some(frame)) => {
-                        trace!("TunTask: we received a frame");
-                        self.sending_packet = Some(frame);
+                    Poll::Ready(Some(packet)) => {
+                        trace!("TunTask: added packet to queue");
+                        self.sending_packet = Some(packet);
                     }
                     Poll::Pending => {
                         trace!("TunTask: no frames");
-                        break
+                        break;
                     }
                     Poll::Ready(None) => unreachable!(),
                 }
             }
         }
-        trace!("TunTask: done looping receiver");
+        trace!("TunTask: done looping sender");
 
         let mut state = mem::replace(&mut self.state, TunTaskState::Invalid);
         loop {
